@@ -14,7 +14,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .store import EvidenceStore
-from .errors import ProvenanceError
+from .errors import ProvenanceError, CountMismatchError, FalseAbsenceError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,157 @@ def extract_fusion_claims(text: str) -> List[str]:
     keywords = ["fusion", "consensus", "multi-model", "openrouter fusion"]
     text_lower = text.lower()
     return [kw for kw in keywords if kw in text_lower]
+
+
+# Countable nouns that indicate a claimed result count (NabaOS result_count check).
+_COUNTABLE_NOUNS = (
+    r"emails?|messages?|results?|records?|items?|files?|rows?|entries?|"
+    r"transactions?|matches?|hits?|documents?|invoices?|orders?|posts?|"
+    r"tickets?|issues?|commits?|deals?|accounts?|holdings?|positions?"
+)
+_COUNT_RE = re.compile(rf"\b(\d+)\s+({_COUNTABLE_NOUNS})\b", re.IGNORECASE)
+
+# Absence phrases (abhāva) - claims that something is not there.
+_ABSENCE_RE = re.compile(
+    r"\b("
+    r"no\s+(?:results?|records?|matches?|emails?|messages?|files?|entries?|data)|"
+    r"not\s+found|"
+    r"does\s+not\s+exist|doesn'?t\s+exist|"
+    r"couldn'?t\s+find|could\s+not\s+find|cannot\s+find|can'?t\s+find|"
+    r"nothing\s+(?:found|in|from|matching)|"
+    r"no\s+such\s+(?:file|record|entry|email|message)|"
+    r"there\s+(?:is|are)\s+no\b|"
+    r"none\s+(?:found|exist)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def extract_count_claims(text: str) -> List[Dict[str, Any]]:
+    """Extract 'N <countable-noun>' claims from text. Returns [{count, noun, phrase}]."""
+    claims = []
+    for m in _COUNT_RE.finditer(text):
+        claims.append({
+            "count": int(m.group(1)),
+            "noun": m.group(2).lower(),
+            "phrase": m.group(0),
+        })
+    return claims
+
+
+def extract_absence_claims(text: str) -> List[str]:
+    """Extract absence assertions ('no results', 'not found', ...) from text."""
+    return [m.group(0) for m in _ABSENCE_RE.finditer(text)]
+
+
+def _cited_result_counts(citations: List[Dict[str, Any]]) -> List[int]:
+    """result_count values available across all citations (claim-supplied 'count' field)."""
+    counts = []
+    for cite in citations:
+        c = cite.get("count")
+        if isinstance(c, int):
+            counts.append(c)
+    return counts
+
+
+def verify_count_claims(
+    body: str,
+    citations: List[Dict[str, Any]],
+    session_id: str,
+    store: EvidenceStore,
+) -> Tuple[bool, List[str]]:
+    """
+    NabaOS count check: every 'N <noun>' claim in the body must be backed by a
+    citation whose receipt result_count equals N.
+
+    A claimed count with NO citation matching it (and where citations exist and
+    disagree) is a violation. If there are no count claims, this passes trivially.
+    """
+    violations: List[str] = []
+    count_claims = extract_count_claims(body)
+    if not count_claims:
+        return True, violations
+
+    for claim in count_claims:
+        n = claim["count"]
+        matched = False
+        for cite in citations:
+            token_id = cite.get("token_id")
+            if not token_id:
+                continue
+            token = store.get(token_id)
+            if token is None:
+                continue
+            if token.result_count == n:
+                matched = True
+                break
+        if not matched:
+            # Do we have any receipt-backed count to contradict it?
+            receipt_counts = []
+            for c in citations:
+                tid = c.get("token_id")
+                if not tid:
+                    continue
+                tok = store.get(tid)
+                if tok is not None:
+                    receipt_counts.append(tok.result_count)
+            if receipt_counts:
+                violations.append(
+                    f"Count mismatch: claimed '{claim['phrase']}' "
+                    f"but receipts report counts {receipt_counts}"
+                )
+            else:
+                violations.append(
+                    f"Uncited count claim: '{claim['phrase']}' has no receipt "
+                    f"with result_count={n}"
+                )
+
+    return (len(violations) == 0, violations)
+
+
+def verify_absence_claims(
+    body: str,
+    citations: List[Dict[str, Any]],
+    session_id: str,
+    store: EvidenceStore,
+) -> Tuple[bool, List[str]]:
+    """
+    NabaOS abhāva check: an absence claim ('not found', 'no results') is only
+    valid if backed by a cited search receipt whose result_count == 0.
+
+    - No citations at all  -> unproven absence (violation).
+    - Cited receipt with result_count > 0 -> the search DID return results;
+      claiming absence is a false-absence lie (violation).
+    - Cited receipt with result_count == 0 -> legitimate absence (pass).
+    """
+    violations: List[str] = []
+    absence_claims = extract_absence_claims(body)
+    if not absence_claims:
+        return True, violations
+
+    # Gather result_counts from all cited receipts that actually resolve.
+    resolved_counts = []
+    for cite in citations:
+        token_id = cite.get("token_id")
+        if not token_id:
+            continue
+        token = store.get(token_id)
+        if token is not None:
+            resolved_counts.append(token.result_count)
+
+    for phrase in absence_claims:
+        if not resolved_counts:
+            violations.append(
+                f"Unproven absence: '{phrase}' — no search receipt backs this claim"
+            )
+        elif all(c > 0 for c in resolved_counts):
+            violations.append(
+                f"False absence: '{phrase}' — cited receipt(s) returned "
+                f"{resolved_counts} result(s), not empty"
+            )
+        # else: at least one receipt has result_count == 0 -> legitimate absence
+
+    return (len(violations) == 0, violations)
 
 
 def verify_send_message_provenance(
@@ -135,7 +286,15 @@ def verify_send_message_provenance(
         )
         if not has_fusion_receipt:
             violations.append(f"Claims Fusion result (keywords: {fusion_keywords}) without execution receipt")
-    
+
+    # NabaOS count-mismatch check (the SHLD / $7,041-refund failure class)
+    count_ok, count_violations = verify_count_claims(body, citations, session_id, store)
+    violations.extend(count_violations)
+
+    # NabaOS false-absence check (the "evidence_store.py is fabricated" failure class)
+    absence_ok, absence_violations = verify_absence_claims(body, citations, session_id, store)
+    violations.extend(absence_violations)
+
     return (len(violations) == 0, violations)
 
 
