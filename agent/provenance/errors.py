@@ -41,3 +41,15 @@ class ContentTamperedError(ProvenanceError):
     """Content hash does not match token - data was altered."""
 
     pass
+
+
+class CountMismatchError(ProvenanceError):
+    """A claimed count/number contradicts the receipt's result_count."""
+
+    pass
+
+
+class FalseAbsenceError(ProvenanceError):
+    """An absence claim ('not found'/'no results') is unbacked by an empty-result receipt."""
+
+    pass
