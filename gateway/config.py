@@ -1342,6 +1342,40 @@ def load_gateway_config() -> GatewayConfig:
                 if "require_mention" in signal_cfg and not os.getenv("SIGNAL_REQUIRE_MENTION"):
                     os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
 
+            # Provenance / fabrication-firewall settings → env vars (env wins).
+            # Behavioral flags live in config.yaml per AGENTS.md (.env = secrets
+            # only, e.g. HERMES_PROVENANCE_SECRET). The provenance gate module
+            # reads these os.environ keys at import time.
+            #   provenance:
+            #     gate:
+            #       send_message: shadow|enforce|off
+            #     checks:
+            #       count: enforce|shadow
+            #       absence: enforce|shadow
+            #       citation: enforce|shadow
+            prov_cfg = yaml_cfg.get("provenance", {})
+            if isinstance(prov_cfg, dict):
+                gate_cfg = prov_cfg.get("gate", {})
+                if isinstance(gate_cfg, dict):
+                    _gate_env = {
+                        "send_message": "PROVENANCE_GATE_SEND_MESSAGE",
+                        "write_file": "PROVENANCE_GATE_WRITE_FILE",
+                        "run_fusion": "PROVENANCE_GATE_RUN_FUSION",
+                    }
+                    for _tool, _env in _gate_env.items():
+                        if _tool in gate_cfg and not os.getenv(_env):
+                            os.environ[_env] = str(gate_cfg[_tool]).lower()
+                checks_cfg = prov_cfg.get("checks", {})
+                if isinstance(checks_cfg, dict):
+                    _check_env = {
+                        "count": "PROVENANCE_CHECK_COUNT",
+                        "absence": "PROVENANCE_CHECK_ABSENCE",
+                        "citation": "PROVENANCE_CHECK_CITATION",
+                    }
+                    for _chk, _env in _check_env.items():
+                        if _chk in checks_cfg and not os.getenv(_env):
+                            os.environ[_env] = str(checks_cfg[_chk]).lower()
+
             # DingTalk settings → env vars: migrated to the dingtalk plugin's
             # apply_yaml_config_fn hook (plugins/platforms/dingtalk/adapter.py).
             # #41112 / #3823.
