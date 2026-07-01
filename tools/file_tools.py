@@ -1491,6 +1491,51 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 "If you are stuck in a loop, stop reading and proceed with writing or responding."
             )
 
+        # ── Provenance Receipt Minting (Week 3) ──────────────────────────
+        # Mint cryptographic receipt for file content so it can be cited.
+        # Only trusted tool code can call mint() - agent cannot.
+        session_id = None
+        try:
+            import inspect
+            frame = inspect.currentframe()
+            while frame:
+                if 'session_id' in frame.f_locals:
+                    session_id = frame.f_locals['session_id']
+                    break
+                frame = frame.f_back
+        except Exception:
+            pass
+        
+        if session_id and result_dict.get("content"):
+            try:
+                from agent.provenance.gate import get_evidence_store
+                import hashlib
+                store = get_evidence_store()
+                if store:
+                    # Hash the content for verification
+                    content_hash = hashlib.sha256(
+                        result_dict["content"].encode()
+                    ).hexdigest()
+                    
+                    token = store.mint(
+                        claim_id=f"read_file.{path}",
+                        source_uri=f"file://{os.path.abspath(_resolved)}",
+                        content={
+                            "path": path,
+                            "content_hash": content_hash,
+                            "total_lines": result_dict.get("total_lines"),
+                            "offset": offset,
+                            "limit": limit,
+                        },
+                        session_id=session_id,
+                        tool_name="read_file",
+                        ttl_seconds=300,  # 5 minutes - files can change quickly
+                    )
+                    result_dict["_provenance_token"] = token.token_id
+                    result_dict["_provenance_claim_id"] = token.claim_id
+            except Exception as prov_err:
+                logger.debug(f"Provenance receipt minting failed (non-fatal): {prov_err}")
+
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))
@@ -2016,6 +2061,46 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             )
 
         result_json = json.dumps(result_dict, ensure_ascii=False)
+
+        # Provenance: mint a receipt carrying result_count so the false-absence
+        # and count-mismatch gates have ground truth. An empty search
+        # (total_count == 0) is exactly what a legitimate "not found" claim
+        # must cite. (NabaOS abhāva verification.)
+        try:
+            session_id = None
+            import inspect as _inspect
+            frame = _inspect.currentframe()
+            while frame:
+                if 'session_id' in frame.f_locals and frame.f_locals['session_id']:
+                    session_id = frame.f_locals['session_id']
+                    break
+                frame = frame.f_back
+            if session_id:
+                from agent.provenance.gate import get_evidence_store
+                store = get_evidence_store()
+                if store and not result_dict.get("error"):
+                    # Only mint when the search actually ran. A search that
+                    # errored must NOT produce a result_count=0 receipt, or a
+                    # failed search could masquerade as proven absence.
+                    total = result_dict.get("total_count")
+                    if total is None:
+                        matches = result_dict.get("matches") or result_dict.get("files") or []
+                        total = len(matches)
+                    store.mint(
+                        claim_id=f"search_files.{target}.{pattern[:50]}",
+                        source_uri=f"fs://search?pattern={pattern}&target={target}&path={path}",
+                        content={"pattern": pattern, "target": target,
+                                 "path": str(path), "file_glob": file_glob},
+                        session_id=session_id,
+                        tool_name="search_files",
+                        ttl_seconds=300,
+                        result_count=int(total),
+                        facts={"pattern": pattern, "target": target,
+                               "total_count": int(total)},
+                    )
+        except Exception as prov_err:  # non-fatal
+            logger.debug(f"search_files provenance mint failed (non-fatal): {prov_err}")
+
         # Hint when results were truncated — explicit next offset is clearer
         # than relying on the model to infer it from total_count vs match count.
         if result_dict.get("truncated"):
