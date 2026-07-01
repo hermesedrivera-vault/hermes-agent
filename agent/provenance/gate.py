@@ -25,6 +25,26 @@ GATE_MODE = {
     "run_fusion": os.environ.get("PROVENANCE_GATE_RUN_FUSION", "off"),
 }
 
+# Per-CHECK enforcement granularity (surgical rollout). A violation is tagged
+# with its class prefix ("[count]", "[absence]", "[citation]"); each class can
+# independently enforce (block) or shadow (log-only). This lets us block the
+# measured-safe count-mismatch class while keeping absence/citation in shadow
+# until their real-traffic false-positive rate is known.
+#   enforce = block on violation of this class
+#   shadow  = log the would-block but allow
+CHECK_MODE = {
+    "count": os.environ.get("PROVENANCE_CHECK_COUNT", "enforce"),
+    "absence": os.environ.get("PROVENANCE_CHECK_ABSENCE", "shadow"),
+    "citation": os.environ.get("PROVENANCE_CHECK_CITATION", "shadow"),
+}
+
+
+def _classify(violation: str) -> str:
+    """Extract the check-class from a violation's '[class] ...' prefix."""
+    if violation.startswith("[") and "]" in violation:
+        return violation[1:violation.index("]")]
+    return "citation"  # untagged legacy violations default to the citation class
+
 # Global provenance enforcement kill switch
 PROVENANCE_DISABLED = os.environ.get("PROVENANCE_DISABLED", "0") == "1"
 
@@ -184,7 +204,7 @@ def verify_count_claims(
         n = claim["count"]
         if n not in available:
             violations.append(
-                f"Count mismatch: claimed '{claim['phrase']}' but session "
+                f"[count] Count mismatch: claimed '{claim['phrase']}' but session "
                 f"receipts report counts {sorted(set(available))}"
             )
 
@@ -217,11 +237,11 @@ def verify_absence_claims(
     for phrase in absence_claims:
         if not available:
             violations.append(
-                f"Unproven absence: '{phrase}' — no search receipt backs this claim"
+                f"[absence] Unproven absence: '{phrase}' — no search receipt backs this claim"
             )
         elif all(c > 0 for c in available):
             violations.append(
-                f"False absence: '{phrase}' — session search receipt(s) returned "
+                f"[absence] False absence: '{phrase}' — session search receipt(s) returned "
                 f"{sorted(set(available))} result(s), not empty"
             )
         # else: at least one receipt has result_count == 0 -> legitimate absence
@@ -255,7 +275,7 @@ def verify_send_message_provenance(
         value = cite.get("value")
         
         if not token_id or not claim_id:
-            violations.append(f"Citation missing token_id or claim_id: {cite}")
+            violations.append(f"[citation] Citation missing token_id or claim_id: {cite}")
             continue
         
         try:
@@ -266,7 +286,7 @@ def verify_send_message_provenance(
                 session_id=session_id
             )
         except ProvenanceError as e:
-            violations.append(f"Citation verification failed for {claim_id}: {str(e)}")
+            violations.append(f"[citation] Citation verification failed for {claim_id}: {str(e)}")
     
     # Defense in depth: check for uncited dollar amounts
     dollar_amounts = extract_dollar_amounts(body)
@@ -280,7 +300,7 @@ def verify_send_message_provenance(
             if isinstance(cite.get("value"), (int, float))
         )
         if not cited:
-            violations.append(f"Uncited dollar amount: {amount}")
+            violations.append(f"[citation] Uncited dollar amount: {amount}")
     
     # Check for Fusion claims without receipts
     fusion_keywords = extract_fusion_claims(body)
@@ -291,7 +311,7 @@ def verify_send_message_provenance(
             for cite in citations
         )
         if not has_fusion_receipt:
-            violations.append(f"Claims Fusion result (keywords: {fusion_keywords}) without execution receipt")
+            violations.append(f"[citation] Claims Fusion result (keywords: {fusion_keywords}) without execution receipt")
 
     # NabaOS count-mismatch check (the SHLD / $7,041-refund failure class)
     count_ok, count_violations = verify_count_claims(body, citations, session_id, store)
@@ -348,34 +368,42 @@ def apply_provenance_gate(
         # Other tools not yet implemented
         return None
     
-    # Log violations
+    # Log violations, split by per-check enforcement mode
     if violations:
+        blocking = [v for v in violations if CHECK_MODE.get(_classify(v), "shadow") == "enforce"]
+        shadowed = [v for v in violations if v not in blocking]
+
         store.audit(
             event="GATE_VIOLATION",
             tool=function_name,
             reason="; ".join(violations),
             session_id=session_id,
             mode=mode,
-            blocked=(mode == "enforce"),
-            details=json.dumps(function_args, default=str)
+            blocked=bool(blocking),
+            details=json.dumps(
+                {"args": function_args, "blocking": blocking, "shadowed": shadowed},
+                default=str,
+            ),
         )
-        
-        if mode == "enforce":
-            # BLOCKED
-            logger.warning(f"Provenance gate BLOCKED {function_name}: {violations}")
+
+        if shadowed:
+            logger.info(f"SHADOW MODE: Would have blocked {function_name} due to: {shadowed}")
+
+        # Only block if the tool gate is on AND at least one ENFORCED-class
+        # violation fired. Shadow-class violations are logged but never block.
+        if mode == "enforce" and blocking:
+            logger.warning(f"Provenance gate BLOCKED {function_name}: {blocking}")
             return json.dumps({
                 "status": "BLOCKED",
                 "error_code": "PROVENANCE_FAILURE",
-                "violations": violations,
+                "violations": blocking,
                 "remediation": (
                     "Re-fetch the data with the appropriate tool to obtain valid provenance tokens. "
                     "Include citations in your message with token_id, claim_id, and value fields."
                 )
             }, ensure_ascii=False)
-        else:
-            # SHADOW MODE: log but allow
-            logger.info(f"SHADOW MODE: Would have blocked {function_name} due to: {violations}")
-            return None
+        # Otherwise allow (shadow, or no enforced-class violation)
+        return None
     
     # All checks passed
     return None
