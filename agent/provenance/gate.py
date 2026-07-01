@@ -123,6 +123,37 @@ def _cited_result_counts(citations: List[Dict[str, Any]]) -> List[int]:
     return counts
 
 
+def _available_result_counts(
+    citations: List[Dict[str, Any]],
+    session_id: str,
+    store: EvidenceStore,
+) -> List[int]:
+    """
+    Result counts available to check a claim against.
+
+    Precedence: explicit citations (Option A) if present; otherwise
+    auto-resolve from this session's search receipts (Option B).
+    Only receipts that actually resolve in this session are counted.
+    """
+    counts: List[int] = []
+    resolved_from_citations = False
+    for cite in citations:
+        tid = cite.get("token_id")
+        if not tid:
+            continue
+        tok = store.get(tid)
+        if tok is not None and tok.session_id == session_id:
+            counts.append(tok.result_count)
+            resolved_from_citations = True
+    if resolved_from_citations:
+        return counts
+    # Option B fallback: session search receipts
+    receipts = store.recent_search_receipts(
+        session_id, tool_names=("search_files", "web_search", "gmail_search")
+    )
+    return [r.result_count for r in receipts]
+
+
 def verify_count_claims(
     body: str,
     citations: List[Dict[str, Any]],
@@ -130,50 +161,32 @@ def verify_count_claims(
     store: EvidenceStore,
 ) -> Tuple[bool, List[str]]:
     """
-    NabaOS count check: every 'N <noun>' claim in the body must be backed by a
-    citation whose receipt result_count equals N.
+    NabaOS count check: every 'N <noun>' claim in the body must be supported by
+    an available receipt whose result_count equals N.
 
-    A claimed count with NO citation matching it (and where citations exist and
-    disagree) is a violation. If there are no count claims, this passes trivially.
+    Available receipts = explicit citations if supplied, else this session's
+    search receipts (auto-resolve). If there are no count claims, passes.
+    If a claim's N matches no available receipt AND at least one receipt
+    contradicts it, it's a violation.
     """
     violations: List[str] = []
     count_claims = extract_count_claims(body)
     if not count_claims:
         return True, violations
 
+    available = _available_result_counts(citations, session_id, store)
+    if not available:
+        # No receipts to check against -> cannot verify. Shadow-safe: do not
+        # hard-block coincidental numbers with zero evidence either way.
+        return True, violations
+
     for claim in count_claims:
         n = claim["count"]
-        matched = False
-        for cite in citations:
-            token_id = cite.get("token_id")
-            if not token_id:
-                continue
-            token = store.get(token_id)
-            if token is None:
-                continue
-            if token.result_count == n:
-                matched = True
-                break
-        if not matched:
-            # Do we have any receipt-backed count to contradict it?
-            receipt_counts = []
-            for c in citations:
-                tid = c.get("token_id")
-                if not tid:
-                    continue
-                tok = store.get(tid)
-                if tok is not None:
-                    receipt_counts.append(tok.result_count)
-            if receipt_counts:
-                violations.append(
-                    f"Count mismatch: claimed '{claim['phrase']}' "
-                    f"but receipts report counts {receipt_counts}"
-                )
-            else:
-                violations.append(
-                    f"Uncited count claim: '{claim['phrase']}' has no receipt "
-                    f"with result_count={n}"
-                )
+        if n not in available:
+            violations.append(
+                f"Count mismatch: claimed '{claim['phrase']}' but session "
+                f"receipts report counts {sorted(set(available))}"
+            )
 
     return (len(violations) == 0, violations)
 
@@ -186,37 +199,30 @@ def verify_absence_claims(
 ) -> Tuple[bool, List[str]]:
     """
     NabaOS abhāva check: an absence claim ('not found', 'no results') is only
-    valid if backed by a cited search receipt whose result_count == 0.
+    valid if an available search receipt has result_count == 0.
 
-    - No citations at all  -> unproven absence (violation).
-    - Cited receipt with result_count > 0 -> the search DID return results;
-      claiming absence is a false-absence lie (violation).
-    - Cited receipt with result_count == 0 -> legitimate absence (pass).
+    Available receipts = explicit citations if supplied, else this session's
+    search receipts (auto-resolve).
+    - No relevant receipt at all -> unproven absence (violation).
+    - All available receipts returned > 0 -> false absence (violation).
+    - At least one receipt with result_count == 0 -> legitimate (pass).
     """
     violations: List[str] = []
     absence_claims = extract_absence_claims(body)
     if not absence_claims:
         return True, violations
 
-    # Gather result_counts from all cited receipts that actually resolve.
-    resolved_counts = []
-    for cite in citations:
-        token_id = cite.get("token_id")
-        if not token_id:
-            continue
-        token = store.get(token_id)
-        if token is not None:
-            resolved_counts.append(token.result_count)
+    available = _available_result_counts(citations, session_id, store)
 
     for phrase in absence_claims:
-        if not resolved_counts:
+        if not available:
             violations.append(
                 f"Unproven absence: '{phrase}' — no search receipt backs this claim"
             )
-        elif all(c > 0 for c in resolved_counts):
+        elif all(c > 0 for c in available):
             violations.append(
-                f"False absence: '{phrase}' — cited receipt(s) returned "
-                f"{resolved_counts} result(s), not empty"
+                f"False absence: '{phrase}' — session search receipt(s) returned "
+                f"{sorted(set(available))} result(s), not empty"
             )
         # else: at least one receipt has result_count == 0 -> legitimate absence
 
