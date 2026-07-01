@@ -250,6 +250,37 @@ class EvidenceStore:
             facts=json.loads(row["facts"]) if "facts" in row.keys() and row["facts"] else {},
         )
 
+    def recent_search_receipts(
+        self, session_id: str, tool_names: Optional[tuple] = None, limit: int = 50
+    ) -> list[ProvenanceToken]:
+        """
+        Return recent receipts for this session, newest first.
+
+        Used by the send_message gate to auto-resolve count/absence claims
+        against real search receipts WITHOUT depending on the model to cite
+        them (defense-in-depth vs NabaOS self-tagging weakness).
+        """
+        if tool_names:
+            placeholders = ",".join("?" for _ in tool_names)
+            rows = self.db.execute(
+                f"""
+                SELECT token_id FROM evidence
+                WHERE session_id = ? AND tool_name IN ({placeholders})
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (session_id, *tool_names, limit),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                """
+                SELECT token_id FROM evidence
+                WHERE session_id = ?
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [t for t in (self.get(r["token_id"]) for r in rows) if t is not None]
+
     def _verify_signature(self, token: ProvenanceToken) -> bool:
         """Verify token signature against current and previous secrets."""
         expected_sig_current = hmac.new(
