@@ -1750,6 +1750,21 @@ def load_gateway_config() -> GatewayConfig:
                         if _chk in checks_cfg and not os.getenv(_env):
                             os.environ[_env] = str(checks_cfg[_chk]).lower()
 
+            # approval_gate.<tool>: shadow|enforce|off  → APPROVAL_GATE_<TOOL>
+            # Controls the outbound-external-comm approval gate (catches emails/
+            # SMS sent without an explicit user "Approved", including sends run
+            # through the terminal tool). Mirrors the provenance bridge above;
+            # env wins if already set. See agent/provenance/approval_gate.py.
+            appr_cfg = yaml_cfg.get("approval_gate", {})
+            if isinstance(appr_cfg, dict):
+                _appr_env = {
+                    "send_message": "APPROVAL_GATE_SEND_MESSAGE",
+                    "terminal": "APPROVAL_GATE_TERMINAL",
+                }
+                for _tool, _env in _appr_env.items():
+                    if _tool in appr_cfg and not os.getenv(_env):
+                        os.environ[_env] = str(appr_cfg[_tool]).lower()
+
             # DingTalk settings → env vars: migrated to the dingtalk plugin's
             # apply_yaml_config_fn hook (plugins/platforms/dingtalk/adapter.py).
             # #41112 / #3823.
