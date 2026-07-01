@@ -11,7 +11,7 @@ import json
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .errors import (
@@ -38,10 +38,16 @@ class ProvenanceToken:
     ttl_seconds: int  # Force fresh retrieval for stale data
     tool_name: str
     signature: str  # HMAC(secret, signable_fields)
+    result_count: int = 0  # Number of results the tool returned (NabaOS: count check)
+    facts: dict = field(default_factory=dict)  # Extracted ground-truth key-values
 
     def signable(self) -> bytes:
-        """Data that is signed with HMAC."""
-        return f"{self.claim_id}|{self.source_uri}|{self.content_hash}|{self.timestamp}".encode()
+        """Data that is signed with HMAC. Includes result_count + facts so they're tamper-proof."""
+        facts_canon = json.dumps(self.facts, sort_keys=True)
+        return (
+            f"{self.claim_id}|{self.source_uri}|{self.content_hash}|"
+            f"{self.timestamp}|{self.result_count}|{facts_canon}"
+        ).encode()
 
 
 class EvidenceStore:
@@ -79,9 +85,14 @@ class EvidenceStore:
                 session_id TEXT NOT NULL,
                 ttl_seconds INTEGER NOT NULL,
                 tool_name TEXT NOT NULL,
-                signature TEXT NOT NULL
+                signature TEXT NOT NULL,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                facts TEXT NOT NULL DEFAULT '{}'
             )
         """)
+        # Backward-compat: add columns if migrating an older DB
+        self._ensure_column("evidence", "result_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("evidence", "facts", "TEXT NOT NULL DEFAULT '{}'")
         self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_evidence_session 
             ON evidence(session_id, timestamp)
@@ -116,6 +127,13 @@ class EvidenceStore:
 
         self.db.commit()
 
+    def _ensure_column(self, table: str, column: str, coldef: str):
+        """Add a column to an existing table if it's missing (idempotent migration)."""
+        cols = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+            self.db.commit()
+
     def mint(
         self,
         claim_id: str,
@@ -124,6 +142,8 @@ class EvidenceStore:
         session_id: str,
         tool_name: str,
         ttl_seconds: int = 3600,
+        result_count: int = 0,
+        facts: Optional[dict] = None,
     ) -> ProvenanceToken:
         """
         MINT a provenance token. ONLY trusted code can call this.
@@ -148,14 +168,11 @@ class EvidenceStore:
         content_hash = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
         timestamp = time.time()
+        facts = facts or {}
 
-        # Create signable data
-        signable = f"{claim_id}|{source_uri}|{content_hash}|{timestamp}".encode()
-
-        # Sign with current secret
-        signature = hmac.new(self._secret_current, signable, hashlib.sha256).hexdigest()
-
-        token = ProvenanceToken(
+        # Build the token first, then sign via its canonical signable() so
+        # mint and verify share ONE signable definition (no drift).
+        unsigned = ProvenanceToken(
             token_id=token_id,
             claim_id=claim_id,
             source_uri=source_uri,
@@ -164,13 +181,26 @@ class EvidenceStore:
             session_id=session_id,
             ttl_seconds=ttl_seconds,
             tool_name=tool_name,
-            signature=signature,
+            signature="",  # placeholder; signature not part of signable()
+            result_count=result_count,
+            facts=facts,
         )
+
+        # Sign the canonical signable payload (includes result_count + facts)
+        signature = hmac.new(
+            self._secret_current, unsigned.signable(), hashlib.sha256
+        ).hexdigest()
+
+        from dataclasses import replace as _dc_replace
+        token = _dc_replace(unsigned, signature=signature)
 
         # Store in database
         self.db.execute(
             """
-            INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO evidence
+                (token_id, claim_id, source_uri, content_hash, timestamp,
+                 session_id, ttl_seconds, tool_name, signature, result_count, facts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 token.token_id,
@@ -182,6 +212,8 @@ class EvidenceStore:
                 token.ttl_seconds,
                 token.tool_name,
                 token.signature,
+                token.result_count,
+                json.dumps(token.facts, sort_keys=True),
             ),
         )
         self.db.commit()
@@ -214,6 +246,8 @@ class EvidenceStore:
             ttl_seconds=row["ttl_seconds"],
             tool_name=row["tool_name"],
             signature=row["signature"],
+            result_count=row["result_count"] if "result_count" in row.keys() else 0,
+            facts=json.loads(row["facts"]) if "facts" in row.keys() and row["facts"] else {},
         )
 
     def _verify_signature(self, token: ProvenanceToken) -> bool:
