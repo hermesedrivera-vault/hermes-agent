@@ -200,7 +200,11 @@ def test_end_to_end_gate_integration(store, session_id):
     # Need to monkey-patch GATE_MODE dict directly
     from agent.provenance import gate as gate_module
     original_mode = gate_module.GATE_MODE.get("send_message")
+    original_citation = gate_module.CHECK_MODE.get("citation")
     gate_module.GATE_MODE["send_message"] = "shadow"
+    # This scenario exercises an uncited dollar amount, a [citation]-class
+    # violation; enforce that class so the block path is under test.
+    gate_module.CHECK_MODE["citation"] = "enforce"
     
     try:
         invalid_args = {
@@ -245,6 +249,7 @@ def test_end_to_end_gate_integration(store, session_id):
             gate_module.GATE_MODE["send_message"] = original_mode
         else:
             gate_module.GATE_MODE.pop("send_message", None)
+        gate_module.CHECK_MODE["citation"] = original_citation or "shadow"
 
 
 def test_complete_system_adversarial_scenarios(store, session_id):
