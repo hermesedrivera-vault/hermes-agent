@@ -208,7 +208,10 @@ def test_forged_signature_detected(store, session_id):
     # Manually insert fake token (simulating agent forgery attempt)
     store.db.execute(
         """
-        INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO evidence
+            (token_id, claim_id, source_uri, content_hash, timestamp,
+             session_id, ttl_seconds, tool_name, signature, result_count, facts)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             fake_token_id,
@@ -220,6 +223,8 @@ def test_forged_signature_detected(store, session_id):
             3600,
             "forged_tool",
             fake_sig,
+            0,
+            "{}",
         ),
     )
     store.db.commit()

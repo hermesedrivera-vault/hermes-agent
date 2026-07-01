@@ -8,6 +8,16 @@ The agent can REQUEST actions but cannot CERTIFY their safety.
 """
 
 from .store import EvidenceStore, ProvenanceToken
-from .errors import ProvenanceError
+from .errors import (
+    ProvenanceError,
+    CountMismatchError,
+    FalseAbsenceError,
+)
 
-__all__ = ["EvidenceStore", "ProvenanceToken", "ProvenanceError"]
+__all__ = [
+    "EvidenceStore",
+    "ProvenanceToken",
+    "ProvenanceError",
+    "CountMismatchError",
+    "FalseAbsenceError",
+]
