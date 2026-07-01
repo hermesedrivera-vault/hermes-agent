@@ -228,6 +228,19 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            },
+            "citations": {
+                "type": "array",
+                "description": "Optional provenance citations backing factual claims in the message (dollar amounts, result counts, absence claims). Each item: {token_id, claim_id, value, count}. token_id/claim_id come from a tool receipt (the _provenance_token/_provenance_claim_id fields in tool output). When omitted, the provenance gate auto-resolves claims against this session's search receipts.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "token_id": {"type": "string"},
+                        "claim_id": {"type": "string"},
+                        "value": {"description": "The cited value (number, string, or list)."},
+                        "count": {"type": "integer", "description": "Result count this citation attests, if applicable."}
+                    }
+                }
             }
         },
         "required": []
