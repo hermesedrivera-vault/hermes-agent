@@ -520,6 +520,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
+    # Session brief (Anthropic Playbook / Thread 2, Component A). Day-stable
+    # carry-forward context (open projects + recent postmortems) retrieved from
+    # the vault. Lives in the volatile tier but is deterministic for the whole
+    # calendar day, so it does not threaten prompt caching (same contract as the
+    # date-only timestamp below). Gated off by default (agent.session_brief_enabled).
+    if getattr(agent, "_session_brief_enabled", False):
+        try:
+            from agent.session_brief import build_session_brief
+            _brief = build_session_brief()
+            if _brief:
+                volatile_parts.append(_brief)
+        except Exception:
+            # Non-fatal: a brief failure must never break prompt assembly.
+            pass
+
     from hermes_time import now as _hermes_now
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
