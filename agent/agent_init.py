@@ -1738,6 +1738,13 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Session-brief toggle (Anthropic Playbook / Thread 2, Component A).
+    # When True, a day-stable "carry-forward context" block (open projects +
+    # recent postmortems, retrieved from the vault) is injected ONCE into the
+    # system-prompt volatile tier. Default False until the cache-safety of the
+    # injection is proven on real traffic — see agent/session_brief.py.
+    agent._session_brief_enabled = bool(_agent_section.get("session_brief_enabled", False))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
