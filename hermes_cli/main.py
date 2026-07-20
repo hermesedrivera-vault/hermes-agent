@@ -4574,6 +4574,73 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
+def _tag_diverged_local_commits_before_reset(
+    git_cmd, cwd, branch: str, pre_pull_sha: str | None
+) -> str | None:
+    """Before a destructive ``reset --hard origin/{branch}``, preserve any
+    local commits that are about to be orphaned by tagging the current tip.
+
+    ``reset --hard`` after a failed ``git pull --ff-only`` is destructive to
+    committed local work that diverged from origin — and for repos whose
+    convention is commit-local-never-push (see AGENTS.md), diverged local
+    commits are an *expected*, not exceptional, state. Discarding them
+    silently caused a real multi-week data-loss incident (agent/provenance/
+    wiped 4x between 2026-07-09 and 2026-07-19 before anyone noticed — see
+    05-Postmortems/2026-07-09-provenance-gate-git-reset-data-loss.md).
+
+    Tags are refs and are never GC-eligible, so tagging the about-to-be-
+    orphaned tip converts "recoverable for ~2 weeks by luck" into
+    "recoverable indefinitely by design" at near-zero cost. If there are no
+    unique local commits (the common, harmless case — e.g. a plain
+    divergent fetch with nothing local), this is a no-op and returns None.
+
+    Returns the tag name on success, or None if there was nothing to tag
+    (no unique commits) or tagging failed (best-effort; failure never blocks
+    the update — the caller proceeds with the reset regardless, falling back
+    to reflog-only recovery).
+    """
+    if not pre_pull_sha:
+        return None
+
+    unique_count_result = subprocess.run(
+        git_cmd + ["rev-list", "--count", f"origin/{branch}..{pre_pull_sha}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if unique_count_result.returncode != 0:
+        return None
+    try:
+        unique_commits = int(unique_count_result.stdout.strip() or "0")
+    except ValueError:
+        return None
+    if unique_commits <= 0:
+        return None
+
+    safety_tag = f"pre-reset-safety-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    tag_result = subprocess.run(
+        git_cmd + ["tag", safety_tag, pre_pull_sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if tag_result.returncode != 0:
+        print(
+            "  ⚠ Could not create safety tag for local commits "
+            "(update will proceed, but recovery relies on reflog only):"
+        )
+        if tag_result.stderr.strip():
+            print(f"    {tag_result.stderr.strip()}")
+        return None
+
+    print(
+        f"  ⚠ {unique_commits} local commit(s) not on origin/{branch} "
+        f"would be discarded — tagged as '{safety_tag}' before resetting."
+    )
+    print(f"    Recover later with: git checkout -b recovery {safety_tag}")
+    return safety_tag
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -10133,8 +10200,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+                # force-pushed or rebase, OR the local checkout has committed
+                # work that was never pushed).  Since local changes are already
+                # stashed, reset to match the remote exactly. First, preserve
+                # any diverged local commits under a safety tag — see
+                # _tag_diverged_local_commits_before_reset for why this
+                # matters (real data-loss incident, agent/provenance/ wiped
+                # 4x between 2026-07-09 and 2026-07-19).
+                safety_tag = _tag_diverged_local_commits_before_reset(
+                    git_cmd, PROJECT_ROOT, branch, pre_pull_sha
+                )
                 print(
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
@@ -10152,6 +10227,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
                     )
                     sys.exit(1)
+                if safety_tag:
+                    print(
+                        f"  ✓ Reset complete. Discarded local commits are preserved under tag '{safety_tag}'."
+                    )
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
