@@ -1667,6 +1667,31 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
+    # Away Mode gate — single wiring point for ALL cron deliveries (agent-driven
+    # and no_agent/script jobs alike), per postmortem 2026-07-27 /
+    # 2026-07-29 (built-and-tested-but-never-wired incident, twice). Routine
+    # deliveries are queued to disk while away; escalation-pattern text still
+    # goes out live. This is the ONLY call site — do not duplicate per-job.
+    try:
+        import sys as _sys
+        _away_mode_dir = str(Path.home() / ".hermes" / "skills" / "devops" / "cron-delivery-gating" / "scripts")
+        if _away_mode_dir not in _sys.path:
+            _sys.path.insert(0, _away_mode_dir)
+        from away_mode import gate_deliver as _away_gate_deliver
+
+        job_name_for_gate = job.get("name", job.get("id", "?"))
+        if _away_gate_deliver(job_name=job_name_for_gate, text=content):
+            logger.info(
+                "Job '%s': Away Mode active — delivery queued (not sent), see "
+                "~/.hermes/cron/output/away_mode_queue/",
+                job_name_for_gate,
+            )
+            return None  # queued, not an error
+    except ImportError:
+        pass  # away_mode module not present — deliver normally (fail-open, not fail-silent-broken)
+    except Exception as _away_err:
+        logger.warning("Away Mode gate check failed (%s) — delivering normally", _away_err)
+
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
     # transcript so a user reply in that chat sees the cron output in context.
