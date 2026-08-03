@@ -1397,7 +1397,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             import inspect
             frame = inspect.currentframe()
             while frame:
-                if 'session_id' in frame.f_locals:
+                # NOTE (2026-08-02, item #3 fix): must check truthiness, not
+                # just key presence — this function's own frame has a local
+                # named 'session_id' (the None assigned above), so a bare
+                # 'in frame.f_locals' check matched depth-0 immediately and
+                # never walked up to the real caller's session_id. This is
+                # why read_file minted ZERO receipts in production despite
+                # this code looking correct (confirmed via live DB query:
+                # 0 read_file rows in provenance.db vs 663 for search_files,
+                # which already had this same truthiness check at line ~1970).
+                if 'session_id' in frame.f_locals and frame.f_locals['session_id']:
                     session_id = frame.f_locals['session_id']
                     break
                 frame = frame.f_back

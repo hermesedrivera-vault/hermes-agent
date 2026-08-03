@@ -732,7 +732,14 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             import inspect
             frame = inspect.currentframe()
             while frame:
-                if 'session_id' in frame.f_locals:
+                # NOTE (2026-08-02, item #3 fix): same bug as file_tools.py
+                # read_file — must check truthiness, not just key presence.
+                # This function's own frame has a local named 'session_id'
+                # (None, assigned above), so a bare 'in frame.f_locals' check
+                # matched immediately at depth 0 and never walked up to find
+                # the real caller's session_id. Confirmed via live DB: 0
+                # web_search rows in provenance.db before this fix.
+                if 'session_id' in frame.f_locals and frame.f_locals['session_id']:
                     session_id = frame.f_locals['session_id']
                     break
                 frame = frame.f_back
