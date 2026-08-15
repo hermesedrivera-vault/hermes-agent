@@ -12,6 +12,23 @@ import pytest
 
 from tools import flux3_video_tool as flux3
 
+
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Phase 12.2: authorize the general file-write gate for this
+    module's tests (they exercise Flux poll/transport/delivery, not the
+    approval gate itself). Same channel and rationale as
+    tests/tools/test_line_ending_preservation.py's Step 9 Phase 3 fixture.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
 GATEWAY = "https://tool-gateway.example.com"
 BASE_URL = f"{GATEWAY}/api/bfl"
 UPLOAD_PATH = "/api/uploads/bfl"
