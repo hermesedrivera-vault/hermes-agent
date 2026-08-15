@@ -889,6 +889,17 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         Args:
             target: Platform target in "platform:identifier" format
             message: The message text to send
+
+        Note (Step 13.3, E1 Option A): this is the one production surface
+        that reaches tools/send_message_tool.py's provenance gate
+        (apply_provenance_gate). No Hermes session_id is threaded through
+        here deliberately — this bridge serves external MCP clients that
+        never minted any Hermes provenance tokens, so a synthetic
+        session_id would let the gate's count/absence checks fire against
+        citation-less MCP-client text with no way to ever supply a valid
+        citation, risking false-positive blocks on harmless external
+        messages. The gate's own fail-open path (no session_id -> allow)
+        is the correct behavior here, not a gap to close.
         """
         if not target or not message:
             return json.dumps({"error": "Both target and message are required"})

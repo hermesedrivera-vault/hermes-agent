@@ -264,7 +264,7 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
-    return _handle_send(args)
+    return _handle_send(args, session_id=kw.get("session_id"))
 
 
 def _handle_list():
@@ -368,12 +368,32 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
-def _handle_send(args):
-    """Send a message to a platform target."""
+def _handle_send(args, session_id=None):
+    """Send a message to a platform target.
+
+    E1 (Step 13.3, Option A): the provenance gate is applied here, inside
+    the tool handler, matching the Step 11 design decision — tool-owned,
+    scoped to this one function, not the shared dispatcher. This preserves
+    the original apply_provenance_gate(function_name, function_args,
+    session_id) contract exactly as designed; no delivery-layer paths
+    (gateway/run.py, cron/scheduler.py, webhook.py) are touched.
+    """
     target = args.get("target", "")
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    try:
+        from agent.provenance.gate import apply_provenance_gate
+        _gate_block = apply_provenance_gate("send_message", args, session_id)
+        if _gate_block is not None:
+            return _gate_block
+    except Exception:
+        # Fail open: a provenance-module import/runtime error must never
+        # block a legitimate send. Mirrors apply_provenance_gate's own
+        # fail-open behavior when session_id is missing (agent/provenance/
+        # gate.py:355-358).
+        pass
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
