@@ -8,11 +8,28 @@ separately and the results are combined or delivered as multiple files.
 import json
 
 
+import pytest
+
 from tools.tts_tool import (
     FALLBACK_MAX_TEXT_LENGTH,
     PROVIDER_MAX_TEXT_LENGTH,
     _resolve_max_text_length,
 )
+
+
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Phase 12.1: authorize the general file-write gate for this
+    module's tests (they exercise per-provider text-length limits, not
+    the approval gate itself)."""
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
 
 
 class TestResolveMaxTextLength:

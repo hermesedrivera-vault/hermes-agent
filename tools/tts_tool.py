@@ -1310,6 +1310,47 @@ def _configured_command_tts_output_path(path: Path, config: Dict[str, Any]) -> P
     return path.with_suffix(f".{fmt}")
 
 
+# Phase 12.1 (Step 9 -> Step 10 -> Step 10.1 -> Step 11 -> Step 12.1
+# authorization/security boundary audit): self-contained, non-destructive
+# path resolution for TTS output. Deliberately NOT imported from
+# tools/flux3_video_tool.py -- same behavior, independently owned, no
+# cross-module coupling between two unrelated tool files.
+_TTS_MAX_FILENAME_ATTEMPTS = 500
+
+
+def _tts_free_path(candidate: Path) -> Path:
+    """``name.mp3`` -> ``name-2.mp3`` -> ``name-3.mp3`` ... so an existing
+    file at ``candidate`` is never clobbered. Pure / no I/O side effects
+    beyond the ``.exists()`` probes needed to find a free name."""
+    if not candidate.exists():
+        return candidate
+    for suffix in range(2, _TTS_MAX_FILENAME_ATTEMPTS + 2):
+        sibling = candidate.with_name(f"{candidate.stem}-{suffix}{candidate.suffix}")
+        if not sibling.exists():
+            return sibling
+    raise ValueError(f"could not find a free filename next to {candidate}")
+
+
+def _tts_authorize_destination(path: Path, task_id: str) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve ``path`` to a non-destructive, non-colliding destination and
+    gate that EXACT resolved path through the canonical Phase-3 general
+    file-write authorization primitive.
+
+    Returns ``(resolved_path, None)`` on success, or ``(None, blocked_json)``
+    when authorization denies the write. The caller must not create,
+    delete, truncate, or otherwise touch the filesystem before this
+    returns successfully, and must write to exactly the path returned
+    here -- never a further-transformed path.
+    """
+    from tools.file_tools import _check_general_file_write
+
+    resolved = _tts_free_path(path)
+    blocked = _check_general_file_write([str(resolved)], task_id)
+    if blocked:
+        return None, blocked
+    return resolved, None
+
+
 def _generate_command_tts(
     text: str,
     output_path: str,
@@ -1329,10 +1370,13 @@ def _generate_command_tts(
             f"tts.providers.{provider_name}.command is not configured"
         )
 
+    # Phase 12.1: destination is authorized and resolved to a non-colliding
+    # path by the caller (_text_to_speech_single) before this function ever
+    # runs. Do NOT re-probe/delete here -- this function must write to
+    # exactly the path it was handed, never a transformed one, and must
+    # never delete an existing file itself.
     output = Path(output_path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        output.unlink()
 
     timeout = _get_command_tts_timeout(config)
     output_format = _get_command_tts_output_format(config, str(output))
@@ -1692,6 +1736,15 @@ def _build_audio_delivery_files(
             )
         if os.path.abspath(source) != os.path.abspath(destination):
             destination.parent.mkdir(parents=True, exist_ok=True)
+            # Phase 12.1: destination derives from the already-authorized
+            # base_path, but a suffix/part-numbering collision against an
+            # unrelated pre-existing file is still possible. os.replace()
+            # silently clobbers an existing destination -- guard it with
+            # the same non-destructive resolution used for the initial
+            # authorization so a chunk-repack can never destroy a file it
+            # didn't create.
+            if destination.exists():
+                destination = _tts_free_path(destination)
             os.replace(source, destination)
         if destination.stat().st_size > profile.max_file_bytes:
             raise ValueError(
@@ -3134,6 +3187,7 @@ def _text_to_speech_single(
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
     tts_config_override: Optional[Dict[str, Any]] = None,
+    task_id: str = "default",
 ) -> str:
     """Synthesize one provider-safe text chunk and return one final-encoded file.
 
@@ -3241,6 +3295,17 @@ def _text_to_speech_single(
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
+
+    # Phase 12.1: every TTS filesystem write -- explicit output_path AND the
+    # default auto-generated audio_cache path alike -- must pass through the
+    # canonical general file-write authorization primitive before any
+    # directory creation or synthesis/write occurs. Resolve to a
+    # non-destructive (never-overwriting) destination first, then authorize
+    # that EXACT resolved path; the path written below must never diverge
+    # from the path just authorized.
+    file_path, _blocked = _tts_authorize_destination(file_path, task_id)
+    if _blocked or file_path is None:
+        return tool_error(_blocked or "TTS output authorization failed", success=False)
 
     # Ensure parent directory exists
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3486,6 +3551,7 @@ def text_to_speech_tool(
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
+    task_id: str = "default",
 ) -> str:
     """Convert text to speech audio with long-form chunking.
 
@@ -3597,7 +3663,13 @@ def text_to_speech_tool(
             base_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             base_path = out_dir / f"tts_{timestamp}.mp3"
-    base_path.parent.mkdir(parents=True, exist_ok=True)
+    # Phase 12.1: base_path (explicit output_path OR the default
+    # auto-generated audio_cache path) is not itself written here -- it is
+    # only used to derive each chunk's output_path, and each chunk's write
+    # is independently authorized and resolved inside
+    # _text_to_speech_single() below. Do NOT create the parent directory
+    # here; that would perform a filesystem side effect before
+    # authorization for the first chunk has run.
 
     generated_artifacts: set[str] = set()
     final_paths: List[str] = []
@@ -3611,7 +3683,14 @@ def text_to_speech_tool(
                 chunk_path = base_path.with_name(
                     f"{base_path.stem}.chunk{index:03d}{base_path.suffix}"
                 )
-            generated_artifacts.add(str(chunk_path))
+            # Phase 12.1: do NOT pre-add chunk_path to generated_artifacts
+            # here. _text_to_speech_single() may resolve chunk_path to a
+            # DIFFERENT non-colliding path when chunk_path is already
+            # occupied by a file this run didn't create -- adding the
+            # pre-resolution path unconditionally would make the cleanup
+            # `finally` block below delete that unrelated pre-existing
+            # file. Only the actual written path (added after the call,
+            # below) may ever be a cleanup candidate.
             raw_result = _text_to_speech_single(
                 text=chunk,
                 output_path=str(chunk_path),
@@ -3619,6 +3698,7 @@ def text_to_speech_tool(
                 instructions=instructions,
                 provider=provider,
                 tts_config_override=tts_config,
+                task_id=task_id,
             )
             try:
                 chunk_result = json.loads(raw_result)
@@ -4499,7 +4579,8 @@ registry.register(
         output_path=args.get("output_path"),
         speed=args.get("speed"),
         instructions=args.get("instructions"),
-        provider=args.get("provider")),
+        provider=args.get("provider"),
+        task_id=kw.get("task_id") or "default"),
     check_fn=check_tts_requirements,
     emoji="🔊",
 )

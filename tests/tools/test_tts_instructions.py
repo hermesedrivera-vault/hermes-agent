@@ -12,6 +12,21 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Phase 12.1: authorize the general file-write gate for this
+    module's tests (they exercise OpenAI instructions passthrough, not
+    the approval gate itself)."""
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
+@pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for key in ("OPENAI_API_KEY", "HERMES_SESSION_PLATFORM"):
         monkeypatch.delenv(key, raising=False)

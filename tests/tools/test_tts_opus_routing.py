@@ -8,6 +8,21 @@ from gateway.session_context import _UNSET, _VAR_MAP
 from tools import tts_tool
 
 
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Phase 12.1: authorize the general file-write gate for this
+    module's tests (they exercise Opus/Telegram output-format routing,
+    not the approval gate itself)."""
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
 def _reset_session_context() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
