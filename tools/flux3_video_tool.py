@@ -438,7 +438,7 @@ def _download_read_timeout(started: float) -> float:
     return max(0.0, min(_DOWNLOAD_READ_TIMEOUT_SECONDS, left))
 
 
-async def _save_if_ready(raw: str, save_to, started: float) -> str:
+async def _save_if_ready(raw: str, save_to, started: float, task_id: str = "default") -> str:
     """Download a finished clip and swap the signed URL for a local path.
 
     The URL is handled here rather than by the model on purpose. It is long and
@@ -475,7 +475,7 @@ async def _save_if_ready(raw: str, save_to, started: float) -> str:
     result.pop("sample", None)
 
     try:
-        target, size = await _download_video(url.strip(), save_to, started)
+        target, size = await _download_video(url.strip(), save_to, started, task_id)
     except Exception as exc:
         payload["result"] = (
             f"The clip finished but saving it failed: {type(exc).__name__}: {exc}. "
@@ -508,18 +508,30 @@ def _delivery_lead_in(target) -> str:
     return f"Saved to {target}. "
 
 
-async def _download_video(url: str, save_to, started: float) -> tuple:
+async def _download_video(url: str, save_to, started: float, task_id: str = "default") -> tuple:
     """Stream the clip to disk, returning (path, bytes).
 
     SSRF-guarded, for the same reason the upload PUT is: this URL comes from
     the vendor by way of the gateway, and it is fetched from the user's own
     machine. Real result URLs are public CDN objects, which the guard allows.
+
+    Phase 12.2 (Step 9 Phase 3 -> Step 10 -> Step 10.1 -> Step 11 -> Step
+    12.2 authorization/security boundary audit): the resolved, non-colliding
+    destination is authorized through the canonical general file-write gate
+    BEFORE anything is written to disk. _resolve_destination() already
+    guarantees the destructive-overwrite half is closed (via _free_path);
+    this closes the remaining arbitrary-path half by requiring approval for
+    that exact resolved path.
     """
     import httpx
 
+    from tools.file_tools import _check_general_file_write
     from tools.url_safety import create_ssrf_safe_async_client
 
     target = _resolve_destination(save_to, _filename_from_url(url))
+    blocked = _check_general_file_write([str(target)], task_id)
+    if blocked:
+        raise ValueError(blocked)
     # Written under a .part name and renamed only once it is complete and
     # plausible, so a failed download can never leave something that looks like
     # a playable file behind.
@@ -696,7 +708,7 @@ def _still_generating(job_id: str) -> str:
     )
 
 
-async def _poll_until_done(url: str, save_to, started: float) -> str:
+async def _poll_until_done(url: str, save_to, started: float, task_id: str = "default") -> str:
     """Look until the job settles, the budget runs out, or the user stops.
 
     The waiting is absorbed here rather than asked of the model. A model has no
@@ -723,7 +735,7 @@ async def _poll_until_done(url: str, save_to, started: float) -> str:
             unanswered = 0
             throttled_for = _retry_after_seconds(raw)
             if throttled_for is None and _poll_is_finished(raw):
-                return await _save_if_ready(raw, save_to, started)
+                return await _save_if_ready(raw, save_to, started, task_id)
             # Never faster than our own cadence, however short a wait the
             # gateway names: its number is a floor on politeness, not a licence
             # to hammer.
@@ -752,6 +764,7 @@ async def _handle_get_result(args: dict, **kwargs) -> str:
     job_id = job_id.strip()
     url = f"{endpoints['base_url']}/generations/{quote(job_id, safe='')}"
     save_to = (args or {}).get("save_to")
+    task_id = kwargs.get("task_id") or "default"
     started = time.monotonic()
 
     # The loop stops itself once its budget is spent, but a look already in
@@ -761,7 +774,7 @@ async def _handle_get_result(args: dict, **kwargs) -> str:
     # arrives as a bare "TimeoutError:".
     try:
         return await asyncio.wait_for(
-            _poll_until_done(url, save_to, started), timeout=_CALL_BACKSTOP_SECONDS
+            _poll_until_done(url, save_to, started, task_id), timeout=_CALL_BACKSTOP_SECONDS
         )
     except asyncio.TimeoutError:
         return _still_generating(job_id)
