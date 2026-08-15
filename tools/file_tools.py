@@ -3,6 +3,7 @@
 
 import base64
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -928,6 +929,283 @@ def _request_protected_instruction_approval(
     return blocked.format(
         why="requires approval but no interactive user or gateway is "
             "present to approve it.")
+
+
+def _general_file_write_param_binding_enabled() -> bool:
+    """Read the ``approvals.general_file_write_param_binding_enabled`` flag.
+
+    Mirrors the exact config-read pattern used by ``_get_approval_config``/
+    ``_get_approval_mode`` in ``tools/approval.py``: read the live
+    ``approvals`` config sub-dict via ``load_config_readonly`` and fail
+    closed (return the safe default, ``False``) on any error so a broken
+    or missing config never silently enables the new behavior.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+        approvals_cfg = config.get("approvals", {}) or {}
+        return bool(approvals_cfg.get(
+            "general_file_write_param_binding_enabled", False))
+    except Exception:
+        return False
+
+
+def _general_file_write_pattern_key(paths: list[str], task_id: str,
+                                     operation_type: str) -> str:
+    """Compute the composite parameter-bound pattern_key (Finding A+B fix).
+
+    ``paths`` must already be the FULL canonical identity for the
+    operation (e.g. the complete V4A path list for patch_v4a), not just
+    the caller's raw ``path=`` argument. Each path is resolved via
+    ``_resolve_path_for_task`` for symlink-consistent canonicalization,
+    then deduplicated and sorted so the key is deterministic and
+    order-independent. Only paths + operation_type are hashed — never file
+    content — so the key is stable across calls describing the same
+    mutation target.
+    """
+    resolved = []
+    for p in paths:
+        try:
+            resolved.append(str(_resolve_path_for_task(p, task_id)))
+        except Exception:
+            resolved.append(str(p))
+    sorted_resolved_paths = sorted(set(resolved))
+    canonical = json.dumps(
+        {"paths": sorted_resolved_paths, "operation": operation_type},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    param_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"general_file_write:{operation_type}::args={param_hash}"
+
+
+def _request_general_file_write_approval(paths: list[str],
+                                          task_id: str = "default",
+                                          operation_type: str = "write_file"
+                                          ) -> str | None:
+    """Gate an ordinary (non-protected-instruction) write_file/patch
+    mutation outside ACP sessions.
+
+    Closes the Step 8.6 confirmed gap: outside ACP sessions, write_file and
+    patch had NO approval mechanism at all for targets that are not one of
+    the protected-instruction basenames. This function reuses the existing
+    session-approval primitives (``is_approved``/``approve_session``) that
+    already back terminal-command approval, scoped to its own
+    ``pattern_key`` so it never interacts with terminal approval state.
+
+    Design (Step 9 Phase 2, explicit spec):
+      - Skipped entirely when an ACP edit-approval requester is bound —
+        ACP's own approval flow (``acp_adapter.edit_approval``) already ran
+        upstream in ``model_tools.py``'s dispatch chain before this tool
+        was even invoked; prompting again here would be a duplicate.
+      - Does NOT consult --yolo / ``approvals.mode=off`` / cron
+        auto-approve. Those bypasses intentionally are NOT wired to this
+        gate — the whole point of Phase 2 is that the flags which
+        legitimately bypass terminal-command approval must not also
+        silently reopen the gap this gate exists to close.
+      - Session-scoped approval is offered (approve once per session,
+        matching ordinary terminal-approval UX) but NOT a permanent
+        allowlist grant — a deliberate middle ground between the
+        protected-instruction gate's zero-persistence (every call) and the
+        terminal gate's full persistent-allowlist flexibility.
+      - Fails closed: any error building/delivering the prompt, an
+        unavailable approval subsystem, or a timeout with no response all
+        block the write. Silence is not consent.
+
+    Step 16 (Finding A+B fix): when
+    ``approvals.general_file_write_param_binding_enabled`` is true, the
+    approval key is bound to BOTH the resolved path set and the
+    ``operation_type`` (``write_file``/``patch_replace``/``patch_v4a``),
+    and identity is looked up via ``get_current_authorization_key()``
+    instead of the bare session key — fixing the prior behavior where a
+    single bare ``"general_file_write"`` approval silently covered every
+    future path/operation for the session. When the flag is false
+    (default), behavior is byte-for-byte identical to before this fix.
+    """
+    try:
+        from acp_adapter.edit_approval import get_edit_approval_requester
+        if get_edit_approval_requester() is not None:
+            # ACP session: ACP's own edit-approval flow already gated this
+            # mutation upstream. Do not double-prompt.
+            return None
+    except Exception:
+        # Can't determine ACP status — fall through to the general gate
+        # rather than silently skipping it. Fail closed, not open.
+        pass
+
+    # Paths under the real ~/.hermes home are already governed by their
+    # own separate mechanisms (config.yaml hard-block, cross-profile
+    # guard, write_approval's staged-approval flow) — same exemption
+    # rationale already documented in _protected_instruction_reason above.
+    # Re-gating them here would be a duplicate/conflicting prompt for a
+    # target already protected by a different, more specific mechanism.
+    real_home = _get_real_hermes_home()
+    if real_home:
+        remaining = []
+        for p in paths:
+            try:
+                resolved = os.path.realpath(str(_resolve_path_for_task(p, task_id)))
+            except (OSError, ValueError, RuntimeError):
+                resolved = os.path.realpath(os.path.normpath(_expand_tilde(p)))
+            if resolved == real_home or resolved.startswith(real_home + os.sep):
+                continue
+            remaining.append(p)
+        if not remaining:
+            return None
+        paths = remaining
+
+    targets = ", ".join(dict.fromkeys(paths))
+    blocked = (
+        f"BLOCKED: file write/patch to {targets} "
+        "{why} The user has NOT consented to this write. Do NOT retry it "
+        "or attempt the same edit via another path (terminal, "
+        "execute_code, etc.)."
+    )
+
+    try:
+        import tools.approval as _approval
+    except Exception:
+        return blocked.format(why="requires approval but the approval "
+                                  "subsystem is unavailable.")
+
+    # Step 16 (Finding A+B fix): when the flag is enabled, bind the
+    # approval identity to the resolved path set + operation type, and
+    # look it up via the Phase-3 composed session::task::sub key instead
+    # of the bare session key. When disabled (default), preserve the
+    # exact prior (unbound) behavior byte-for-byte for a safe rollout.
+    if _general_file_write_param_binding_enabled():
+        pattern_key = _general_file_write_pattern_key(
+            paths, task_id, operation_type)
+        session_key = _approval.get_current_authorization_key()
+    else:
+        pattern_key = "general_file_write"
+        session_key = _approval.get_current_session_key()
+
+    # Session-scoped approval already granted this session — skip re-prompt.
+    try:
+        if _approval.is_approved(session_key, pattern_key):
+            return None
+    except Exception:
+        pass  # Fall through to prompting; fail closed on doubt, not open.
+
+    display = f"<write to {targets}>"
+    description = (
+        f"Write/patch to file(s) outside ACP session: {targets}. "
+        "This is the general (non-protected-instruction) file-mutation "
+        "approval gate — closes the Step 8.6 confirmed authorization gap. "
+        "Not bypassed by --yolo."
+    )
+
+    # Gateway surface: block on the button round-trip when a notify
+    # callback is registered for this session (Telegram/Discord/Slack).
+    notify_cb = None
+    try:
+        with _approval._lock:
+            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+    except Exception:
+        notify_cb = None
+
+    if notify_cb is not None:
+        approval_data = {
+            "command": display,
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
+            "description": description,
+            "allow_permanent": False,
+            "allow_session": True,
+        }
+        decision = _approval._await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway",
+        )
+        if decision.get("notify_failed"):
+            return blocked.format(
+                why="requires approval but the approval request could "
+                    "not be delivered.")
+        choice = decision.get("choice")
+        if decision.get("resolved") and choice in {"once", "session", "always"}:
+            if choice in {"session", "always"}:
+                try:
+                    _approval.approve_session(session_key, pattern_key)
+                except Exception:
+                    pass
+            return None
+        if not decision.get("resolved"):
+            return blocked.format(
+                why="approval prompt timed out without a user response. "
+                    "Silence is not consent.")
+        return blocked.format(why="was denied by the user.")
+
+    # CLI surface: per-thread approval callback (prompt_toolkit panel).
+    callback = None
+    try:
+        from tools.terminal_tool import _get_approval_callback
+        callback = _get_approval_callback()
+    except Exception:
+        callback = None
+
+    if callback is not None:
+        choice = _approval.prompt_dangerous_approval(
+            display, description,
+            allow_permanent=False,
+            approval_callback=callback,
+        )
+        if choice in {"once", "session", "always"}:
+            if choice in {"session", "always"}:
+                try:
+                    _approval.approve_session(session_key, pattern_key)
+                except Exception:
+                    pass
+            return None
+        if choice == "timeout":
+            return blocked.format(
+                why="approval prompt timed out without a user response. "
+                    "Silence is not consent.")
+        return blocked.format(why="was denied by the user.")
+
+    # No human channel at all (script, cron, background thread): fail
+    # closed. Silently allowing here would recreate the exact gap this
+    # gate exists to close.
+    return blocked.format(
+        why="requires approval but no interactive user or gateway is "
+            "present to approve it.")
+
+
+def _check_general_file_write(paths: list[str],
+                              task_id: str = "default",
+                              operation_type: str = "write_file"
+                              ) -> str | None:
+    """Gate an ordinary write_file/patch mutation (Step 9 Phase 2).
+
+    Returns ``None`` when the write is approved (or the gate is skipped
+    because an ACP requester already handled it), otherwise a BLOCKED
+    error string. Callers must invoke this AFTER
+    ``_check_protected_instruction_write`` so that gate's stricter,
+    always-ask behavior for protected-instruction targets remains the
+    controlling gate for those specific files. This function additionally
+    excludes any path that IS a protected-instruction target from its own
+    check — those already got their (mandatory, always-ask) approval from
+    the protected-instruction gate, and re-gating them here would be a
+    duplicate prompt for the same mutation.
+
+    ``operation_type`` (Step 16, Finding A+B fix) identifies the specific
+    mutation kind — ``"write_file"``, ``"patch_replace"``, or
+    ``"patch_v4a"`` — and is folded into the approval identity when
+    ``approvals.general_file_write_param_binding_enabled`` is true, so
+    approving one operation type/path never silently covers another.
+    """
+    if not paths:
+        return None
+    enabled, extra = _protected_instruction_config()
+    non_protected = [
+        p for p in paths
+        if not _protected_instruction_reason(p, task_id, enabled=enabled,
+                                             extra_patterns=extra)
+    ]
+    if not non_protected:
+        # Every target was already gated (and approved) by the
+        # protected-instruction check above — nothing left to re-gate.
+        return None
+    return _request_general_file_write_approval(
+        non_protected, task_id, operation_type)
 
 
 def _check_protected_instruction_write(paths: list[str],
@@ -2168,6 +2446,30 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
         return tool_error(protected_err)
+    # Step 9 Phase 2: general non-ACP file-write approval gate. Only
+    # reached for non-protected-instruction targets — that gate above
+    # remains the controlling, stricter always-ask boundary for its
+    # narrower scope. Phase 2.1: any exception raised while determining
+    # authorization (approval subsystem broken, gateway unreachable, etc.)
+    # must fail CLOSED as a clean BLOCKED response, not escape as a raw
+    # exception and not be treated as an implicit approval.
+    try:
+        general_err = _check_general_file_write(
+            [path], task_id, operation_type="write_file")
+    except Exception as _general_gate_exc:
+        logger.warning(
+            "General file-write approval gate raised; failing closed: %s: %s",
+            type(_general_gate_exc).__name__, _general_gate_exc,
+        )
+        return tool_error(
+            f"BLOCKED: file write to {path} requires approval but the "
+            "approval subsystem raised an unexpected error "
+            f"({type(_general_gate_exc).__name__}). The user has NOT "
+            "consented to this write. Do NOT retry it or attempt the "
+            "same edit via another path (terminal, execute_code, etc.)."
+        )
+    if general_err:
+        return tool_error(general_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -2305,6 +2607,30 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
     if protected_err:
         return tool_error(protected_err)
+    # Step 9 Phase 2: general non-ACP file-write approval gate, one prompt
+    # for the whole patch (same all-or-nothing shape as the protected-
+    # instruction gate above). Only reached for paths that passed the
+    # protected-instruction check. Phase 2.1: fail closed on exceptions
+    # from the gate itself, same rationale as write_file_tool above.
+    try:
+        _general_op_type = "patch_replace" if mode == "replace" else "patch_v4a"
+        general_err = _check_general_file_write(
+            _paths_to_check, task_id, operation_type=_general_op_type)
+    except Exception as _general_gate_exc:
+        logger.warning(
+            "General file-write approval gate raised; failing closed: %s: %s",
+            type(_general_gate_exc).__name__, _general_gate_exc,
+        )
+        _targets = ", ".join(dict.fromkeys(_paths_to_check))
+        return tool_error(
+            f"BLOCKED: file patch to {_targets} requires approval but the "
+            "approval subsystem raised an unexpected error "
+            f"({type(_general_gate_exc).__name__}). The user has NOT "
+            "consented to this write. Do NOT retry it or attempt the "
+            "same edit via another path (terminal, execute_code, etc.)."
+        )
+    if general_err:
+        return tool_error(general_err)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
