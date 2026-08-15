@@ -1670,6 +1670,20 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Phase 3 (HERMES REFACTOR Step 9): capture the parent's active
+    # session+task+subagent authorization identity at spawn time so an
+    # explicit, opt-in inheritance copy (see inherit_parent_approvals in
+    # delegate_task) has a concrete source key to copy from. This is NOT an
+    # automatic grant — by itself it changes no authorization behavior; a
+    # caller must explicitly request inheritance for it to take effect.
+    try:
+        from tools import approval as _approval_scope_mod
+
+        child._parent_authorization_id = (
+            _approval_scope_mod.get_current_authorization_key()
+        )
+    except Exception:
+        child._parent_authorization_id = ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2907,6 +2921,13 @@ def _build_child_preserving_parent_tools(**kwargs):
     """Build a child without leaking its resolved toolset into the parent."""
     import model_tools
 
+    # Phase 3 (HERMES REFACTOR Step 9): explicit, opt-in parent->child
+    # authorization inheritance. Pulled out of kwargs here (rather than
+    # threaded into _build_child_agent's signature) so the child-construction
+    # function itself stays authorization-agnostic — inheritance is applied
+    # once, after construction, as an explicit copy.
+    inherit_parent_approvals = bool(kwargs.pop("inherit_parent_approvals", False))
+
     with _CHILD_CONSTRUCTION_LOCK:
         parent_tool_names = list(model_tools._last_resolved_tool_names)
         try:
@@ -2914,6 +2935,28 @@ def _build_child_preserving_parent_tools(**kwargs):
         finally:
             model_tools._last_resolved_tool_names = parent_tool_names
     child._delegate_saved_tool_names = parent_tool_names
+
+    if inherit_parent_approvals:
+        try:
+            # The child's task_id is generated fresh per-turn as a UUID
+            # (run_agent.py: effective_task_id = task_id or uuid4()) and is
+            # NOT known at spawn time, so the actual composed
+            # session+task+subagent key the child's first tool call will use
+            # can't be predicted here. Stash the parent's key and apply the
+            # explicit, one-time inheritance copy lazily on the child's first
+            # tool dispatch (agent/tool_executor.py), once the real task_id
+            # is known. This remains opt-in: nothing is copied unless
+            # inherit_parent_approvals=True was passed for this delegation.
+            child._pending_authorization_inheritance = (
+                getattr(child, "_parent_authorization_id", "") or ""
+            )
+        except Exception:
+            logger.debug(
+                "Failed to stash pending authorization inheritance for "
+                "subagent %s",
+                getattr(child, "_subagent_id", "?"),
+            )
+
     return child
 
 
@@ -3138,6 +3181,7 @@ def delegate_task(
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     parent_agent=None,
+    inherit_parent_approvals: Optional[bool] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -3150,6 +3194,12 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    inherit_parent_approvals: when True, the child explicitly inherits the
+    calling task's currently-approved authorization patterns (Phase 3,
+    HERMES REFACTOR Step 9). Default False — a subagent does NOT
+    automatically share the parent's approvals merely by being spawned in
+    the same session; this must be requested per-delegation.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3362,6 +3412,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            inherit_parent_approvals=bool(inherit_parent_approvals),
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.

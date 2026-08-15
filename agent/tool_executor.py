@@ -519,6 +519,36 @@ def _run_agent_tool_execution_middleware(
             state["blocked"] = False
             state["args"] = final_args
 
+        # Phase 3 (HERMES REFACTOR Step 9): bind session + task + subagent
+        # identity for the duration of this tool's authorization checks and
+        # execution. Composed via get_current_authorization_key() inside
+        # tools/approval.py — a grant made under this task/subagent does not
+        # satisfy is_approved() checks made under a different task/subagent
+        # in the same session.
+        from tools import approval as _approval_scope_mod
+
+        _authz_scope_tokens = _approval_scope_mod.set_current_authorization_scope(
+            _approval_scope_mod.get_current_session_key(),
+            task_id=effective_task_id or "",
+            subagent_id=getattr(agent, "_subagent_id", None) or "",
+        )
+
+        # Phase 3: consume a pending explicit parent->child authorization
+        # inheritance exactly once, now that the real composed key (with the
+        # actual effective_task_id) is known. Only present when
+        # inherit_parent_approvals=True was passed to delegate_task for this
+        # subagent — absent for every ordinary tool call.
+        _pending_inherit = getattr(agent, "_pending_authorization_inheritance", "")
+        if _pending_inherit:
+            try:
+                _approval_scope_mod.inherit_authorization_from_parent(
+                    _pending_inherit,
+                    _approval_scope_mod.get_current_authorization_key(),
+                )
+            except Exception:
+                pass
+            agent._pending_authorization_inheritance = ""
+
         def _begin() -> None:
             _begin_tool_execution(
                 agent,
@@ -599,6 +629,7 @@ def _run_agent_tool_execution_middleware(
                 error_message=error_message,
                 middleware_trace=list(state["middleware_trace"]),
             )
+            _approval_scope_mod.reset_current_authorization_scope(_authz_scope_tokens)
             return result
 
         if function_name == "memory":
@@ -607,7 +638,10 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+        try:
+            return execute(final_args)
+        finally:
+            _approval_scope_mod.reset_current_authorization_scope(_authz_scope_tokens)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(

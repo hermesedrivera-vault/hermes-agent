@@ -52,6 +52,24 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="",
 )
 
+# Task + subagent identity layered on top of session identity (Phase 3,
+# HERMES REFACTOR Step 9). A session_key alone is NOT sufficient authorization
+# identity: two concurrent tasks (or a parent task and its spawned subagent)
+# sharing one session_key must not silently share an approval grant. These
+# contextvars are set by set_current_authorization_scope() at the same call
+# sites that already call set_current_session_key(); when unset (task_id ""),
+# get_current_authorization_key() collapses to the plain session key so
+# callers that haven't been wired up yet (legacy CLI/cron paths) keep their
+# existing behavior exactly.
+_approval_task_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_task_id",
+    default="",
+)
+_approval_subagent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_subagent_id",
+    default="",
+)
+
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
 # os.environ["HERMES_INTERACTIVE"] races: one session's restore in `finally`
@@ -213,6 +231,83 @@ def get_current_session_key(default: str = "default") -> str:
         return session_key
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
+
+
+def set_current_authorization_scope(
+    session_key: str,
+    task_id: str = "",
+    subagent_id: str = "",
+) -> tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]]:
+    """Bind session + task + subagent identity for the current context.
+
+    Phase 3 (HERMES REFACTOR Step 9): the canonical authorization identity
+    is session + task + subagent, not session alone. Callers that already
+    call set_current_session_key() should call this instead (it also sets
+    the session key), passing the calling task's effective_task_id and,
+    when running inside a spawned subagent, that subagent's _subagent_id.
+
+    Top-level tasks with no subagent MUST pass subagent_id="" explicitly
+    (the default) rather than omitting task scoping altogether — this keeps
+    "no subagent" a represented state rather than a silent collapse back to
+    session-only identity.
+    """
+    return (
+        _approval_session_key.set(session_key or ""),
+        _approval_task_id.set(task_id or ""),
+        _approval_subagent_id.set(subagent_id or ""),
+    )
+
+
+def reset_current_authorization_scope(
+    tokens: tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]],
+) -> None:
+    """Restore the prior session + task + subagent context."""
+    session_token, task_token, subagent_token = tokens
+    _approval_subagent_id.reset(subagent_token)
+    _approval_task_id.reset(task_token)
+    _approval_session_key.reset(session_token)
+
+
+def get_current_authorization_key(default: str = "default") -> str:
+    """Return the composed session+task+subagent authorization identity.
+
+    When no task_id has been set for the current context (legacy/unwired
+    callers — CLI, cron, older transports), this collapses to exactly
+    get_current_session_key()'s value, preserving existing behavior for
+    every call site that has not been migrated to
+    set_current_authorization_scope(). Once a caller sets task_id, grants
+    made under one task_id/subagent_id combination do not satisfy
+    is_approved() checks made under a different one, even within the same
+    session_key — this is the Phase 3 security boundary.
+    """
+    session_key = get_current_session_key(default=default)
+    task_id = _approval_task_id.get()
+    if not task_id:
+        return session_key
+    subagent_id = _approval_subagent_id.get()
+    return f"{session_key}::task={task_id}::sub={subagent_id}"
+
+
+def inherit_authorization_from_parent(
+    parent_authorization_key: str,
+    child_authorization_key: str,
+) -> None:
+    """Explicitly copy a parent's approved patterns onto a child's scope.
+
+    This is an intentional, one-time, opt-in copy — never an automatic
+    lookup-through. A subagent must not inherit its parent's grants merely
+    by sharing a session_key; inheritance only happens when a caller
+    (delegate_task, when inherit_parent_approvals=True) explicitly invokes
+    this function with both composed keys.
+    """
+    if not parent_authorization_key or not child_authorization_key:
+        return
+    with _lock:
+        parent_patterns = set(_session_approved.get(parent_authorization_key, set()))
+        if parent_patterns:
+            _session_approved.setdefault(child_authorization_key, set()).update(
+                parent_patterns
+            )
 
 
 def _get_session_platform() -> str:
@@ -3201,7 +3296,9 @@ def _run_approval_gate(
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
+    # Phase 3: composed session+task+subagent identity — collapses to plain
+    # session_key for callers not yet wired to set_current_authorization_scope.
+    session_key = get_current_authorization_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -3912,7 +4009,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
-    session_key = get_current_session_key()
+    session_key = get_current_authorization_key()
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -4293,7 +4390,7 @@ def check_execute_code_guard(code: str, env_type: str,
     if not is_gateway and not is_ask:
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
+    session_key = get_current_authorization_key()
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"

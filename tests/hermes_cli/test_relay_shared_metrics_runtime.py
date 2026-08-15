@@ -748,7 +748,11 @@ def test_real_binding_correlates_plugin_approval_denial_to_tool_metric(
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
     monkeypatch.setattr(approval, "is_approved", lambda *args: False)
-    monkeypatch.setattr(approval, "get_current_session_key", lambda: "session-key")
+    monkeypatch.setattr(
+        approval,
+        "get_current_session_key",
+        lambda default="default": "session-key",
+    )
     monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
     monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
     monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *args, **kwargs: "deny")
