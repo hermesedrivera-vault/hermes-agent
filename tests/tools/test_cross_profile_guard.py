@@ -18,6 +18,27 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests (see tests/tools/test_file_write_safety.py::
+    TestGeneralFileWriteApproval for the canonical pattern). This file
+    tests the CROSS-PROFILE guard specifically, which runs AFTER the
+    general-write gate in write_file_tool/patch_tool — granting general
+    approval here does not skip or weaken the cross-profile check itself,
+    it only clears the unrelated prerequisite gate so execution reaches
+    the cross-profile logic under test.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
 @pytest.fixture
 def fake_hermes(tmp_path, monkeypatch):
     """Build a two-profile Hermes layout and point HERMES_HOME at

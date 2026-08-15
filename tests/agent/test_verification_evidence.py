@@ -132,15 +132,28 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
     )
 
     from tools.file_tools import write_file_tool
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
 
-    result = json.loads(
-        write_file_tool(
-            str(target),
-            "export const ok = true\n",
-            task_id="turn",
-            session_id="conversation",
+    # Step 9 Phase 2: this test exercises verification-evidence staleness
+    # tracking through a real write_file_tool call, not the approval gate.
+    # Explicitly grant the general file-write approval (same channel as
+    # tests/tools/test_file_write_safety.py::TestGeneralFileWriteApproval)
+    # so the write reaches the evidence-staling behavior under test.
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    try:
+        result = json.loads(
+            write_file_tool(
+                str(target),
+                "export const ok = true\n",
+                task_id="turn",
+                session_id="conversation",
+            )
         )
-    )
+    finally:
+        set_approval_callback(None)
+        _approval.clear_session(session_key)
 
     assert result["files_modified"] == [str(target.resolve())]
     assert verification_status(session_id="conversation", cwd=tmp_path)["status"] == "stale"

@@ -16,6 +16,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from tools import file_state
 from tools.file_tools import (
     read_file_tool,
@@ -24,6 +26,24 @@ from tools.file_tools import (
     _check_file_staleness,
     _read_tracker,
 )
+
+
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests (see tests/tools/test_file_write_safety.py::
+    TestGeneralFileWriteApproval for the canonical pattern). These tests
+    exercise staleness-detection behavior, not the write approval gate —
+    the write must be allowed to reach that behavior.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
 
 
 # ---------------------------------------------------------------------------

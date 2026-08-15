@@ -8,6 +8,24 @@ import pytest
 from tools.file_tools import write_file_tool
 
 
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests (see tests/tools/test_file_write_safety.py::
+    TestGeneralFileWriteApproval for the canonical pattern). These tests
+    exercise post-write verification, not the approval gate — the write
+    must be allowed to reach that behavior.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
 @pytest.fixture
 def workdir(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))

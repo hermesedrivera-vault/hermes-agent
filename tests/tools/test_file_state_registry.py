@@ -23,6 +23,8 @@ import threading
 import time
 import unittest
 
+import pytest
+
 from tools import file_state
 from tools.file_tools import (
     read_file_tool,
@@ -36,6 +38,26 @@ def _tmp_file(content: str = "initial\n") -> str:
     with os.fdopen(fd, "w") as f:
         f.write(content)
     return path
+
+
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests (see tests/tools/test_file_write_safety.py::
+    TestGeneralFileWriteApproval for the canonical pattern). These tests
+    exercise the cross-agent FileStateRegistry, not the write approval
+    gate — the write must be allowed to reach that behavior. Applies to
+    the unittest.TestCase classes below via pytest's autouse-fixture
+    support for unittest tests.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
 
 
 class FileStateRegistryUnitTests(unittest.TestCase):

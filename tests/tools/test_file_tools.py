@@ -15,6 +15,26 @@ from tools.file_tools import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests, via the same CLI-approval-callback channel
+    ``TestGeneralFileWriteApproval`` (tests/tools/test_file_write_safety.py)
+    uses. These tests exercise write_file_tool/patch_tool's dispatch,
+    validation, and caching behavior — not the approval gate itself — so
+    the write must be allowed to reach that behavior rather than being
+    fail-closed for lack of an approval channel.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
 class TestReadFileHandler:
     @patch("tools.file_tools._get_file_ops")
     def test_returns_file_content(self, mock_get):

@@ -16,6 +16,24 @@ import pytest
 from tools.fuzzy_match import is_already_applied
 
 
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests (see tests/tools/test_file_write_safety.py::
+    TestGeneralFileWriteApproval for the canonical pattern). These tests
+    exercise already-applied-patch detection, not the write approval
+    gate — the write must be allowed to reach that behavior.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
 class TestIsAlreadyApplied:
     def test_identical_strings_present_in_content(self):
         assert is_already_applied("x = compute_value(1)\n", "compute_value(1)", "compute_value(1)")

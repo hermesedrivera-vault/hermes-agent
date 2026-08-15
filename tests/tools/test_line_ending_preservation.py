@@ -13,6 +13,26 @@ import json
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _grant_general_file_write_approval():
+    """Explicitly authorize the Step 9 Phase 2 general file-write gate for
+    this module's tests, via the same CLI-approval-callback channel
+    ``TestGeneralFileWriteApproval`` (tests/tools/test_file_write_safety.py)
+    uses. These tests exercise write_file/patch line-ending preservation —
+    not the approval gate itself — so the write must be allowed to reach
+    that behavior rather than being fail-closed for lack of an approval
+    channel.
+    """
+    from tools.terminal_tool import set_approval_callback
+    import tools.approval as _approval
+
+    session_key = _approval.get_current_session_key()
+    set_approval_callback(lambda *a, **kw: "session")
+    yield
+    set_approval_callback(None)
+    _approval.clear_session(session_key)
+
+
 @pytest.fixture
 def hermes_home(monkeypatch, tmp_path):
     """Isolate HERMES_HOME so the tests don't pollute the real config.
