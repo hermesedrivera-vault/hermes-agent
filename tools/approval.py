@@ -4338,7 +4338,12 @@ def check_execute_code_guard(code: str, env_type: str,
     trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
     require approval).
     """
-    pattern_key = "execute_code"
+    import json
+    _canonical = json.dumps(
+        {"code": code}, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    _code_hash = hashlib.sha256(_canonical.encode("utf-8")).hexdigest()[:16]
+    pattern_key = f"execute_code::args={_code_hash}"
     description = (
         "execute_code script execution. The script can spawn subprocesses or "
         "mutate files without passing through terminal command approval; "

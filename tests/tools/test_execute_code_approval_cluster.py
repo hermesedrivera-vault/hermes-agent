@@ -134,6 +134,17 @@ def gw_session(monkeypatch):
             A._gateway_notify_cbs.pop(session_key, None)
 
 
+def _code_key(code: str) -> str:
+    """Mirror check_execute_code_guard's pattern_key construction (Step 19.2)
+    so tests can compute the expected key without duplicating internals."""
+    import json
+    _canonical = json.dumps(
+        {"code": code}, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    _code_hash = A.hashlib.sha256(_canonical.encode("utf-8")).hexdigest()[:16]
+    return f"execute_code::args={_code_hash}"
+
+
 def _register_resolver(session_key: str, result):
     """Register a gateway notify callback that immediately resolves the most
     recent queued approval entry with *result* (simulating a user response)."""
@@ -230,22 +241,72 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
     assert res["approved"] is True
     assert res.get("user_approved") is True
     # One-shot: approval must NOT persist to future scripts.
-    assert A.is_approved(gw_session, "execute_code") is False
+    guard_key = _code_key("import os; print(1)")
+    assert A.is_approved(gw_session, guard_key) is False
 
 
 def test_guard_session_approval_short_circuits_prompt(gw_session):
-    """Once session-approved, execute_code skips the approval prompt (#39275)."""
-    # Manually set session approval.
-    A.approve_session(gw_session, "execute_code")
+    """Once session-approved, execute_code skips the approval prompt for the
+    SAME code (#39275's legitimate reuse), but a materially different code
+    string must NOT inherit that approval (Step 19.2 argument-binding fix)."""
+    code_a = "import os"
+    code_b = "import sys"
+    key_a = _code_key(code_a)
+    # Manually set session approval for code_a specifically.
+    A.approve_session(gw_session, key_a)
     try:
-        # Even with a denier registered, the is_approved check short-circuits.
+        # Even with a denier registered, the SAME code short-circuits.
         _register_resolver(gw_session, "deny")
-        res = A.check_execute_code_guard("import os", "local")
+        res = A.check_execute_code_guard(code_a, "local")
         assert res["approved"] is True
+
+        # A materially different code string must NOT reuse code_a's grant.
+        _register_resolver(gw_session, "deny")
+        res_b = A.check_execute_code_guard(code_b, "local")
+        assert res_b["approved"] is False
     finally:
         with A._lock:
             s = A._session_approved.get(gw_session, set())
-            s.discard("execute_code")
+            s.discard(key_a)
+
+
+def test_guard_once_remains_one_shot_per_code(gw_session):
+    """"once" approval for a given code must not persist a session/permanent
+    grant, and a fresh call with the SAME code still prompts again."""
+    code_a = "import os; print('once')"
+    key_a = _code_key(code_a)
+
+    _register_resolver(gw_session, "once")
+    res = A.check_execute_code_guard(code_a, "local")
+    assert res["approved"] is True
+    # "once" must not have persisted anything under this code's key.
+    assert A.is_approved(gw_session, key_a) is False
+
+    # A second call with the SAME code must prompt again (no reuse from "once").
+    _register_resolver(gw_session, "deny")
+    res2 = A.check_execute_code_guard(code_a, "local")
+    assert res2["approved"] is False
+
+
+def test_guard_scope_isolation_preserved_under_code_binding(gw_session):
+    """Same code, two different authorization scopes: approval in one scope
+    must not leak into the other (Step 9 scope axis still composes with the
+    new code-bound pattern_key)."""
+    code_a = "import os; print('scope-test')"
+    key_a = _code_key(code_a)
+
+    # Session-approve code_a under this scope (gw_session).
+    A.approve_session(gw_session, key_a)
+    try:
+        assert A.is_approved(gw_session, key_a) is True
+
+        # A different scope key must NOT see this grant.
+        other_scope_key = gw_session + "::other-subagent"
+        assert A.is_approved(other_scope_key, key_a) is False
+    finally:
+        with A._lock:
+            s = A._session_approved.get(gw_session, set())
+            s.discard(key_a)
 
 
 def test_guard_gateway_missing_notify_is_pending(gw_session):
