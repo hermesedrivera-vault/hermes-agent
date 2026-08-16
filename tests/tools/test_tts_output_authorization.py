@@ -237,9 +237,10 @@ class TestFinalResolvedPathMatchesAuthorizedPath:
         from tools import file_tools as ft
         original = ft._check_general_file_write
 
-        def spy(paths, task_id="default"):
+        def spy(paths, task_id="default", operation_type="write_file"):
             captured["paths"] = list(paths)
-            return original(paths, task_id)
+            captured["operation_type"] = operation_type
+            return original(paths, task_id, operation_type=operation_type)
 
         monkeypatch.setattr(ft, "_check_general_file_write", spy)
         # tts_tool imports the function locally inside _tts_authorize_destination,
@@ -252,6 +253,11 @@ class TestFinalResolvedPathMatchesAuthorizedPath:
         assert captured.get("paths") == [res["file_path"]], (
             "the path passed to the authorization primitive must be "
             "identical to the path actually written"
+        )
+        assert captured.get("operation_type") == "tts_output", (
+            "Step 17.4: TTS output writes must use the distinct "
+            "operation_type='tts_output' identity, not the generic "
+            "'write_file' default"
         )
 
 

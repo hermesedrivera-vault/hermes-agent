@@ -529,7 +529,8 @@ async def _download_video(url: str, save_to, started: float, task_id: str = "def
     from tools.url_safety import create_ssrf_safe_async_client
 
     target = _resolve_destination(save_to, _filename_from_url(url))
-    blocked = _check_general_file_write([str(target)], task_id)
+    blocked = _check_general_file_write(
+        [str(target)], task_id, operation_type="flux_output")
     if blocked:
         raise ValueError(blocked)
     # Written under a .part name and renamed only once it is complete and

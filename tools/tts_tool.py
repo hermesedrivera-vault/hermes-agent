@@ -1345,7 +1345,8 @@ def _tts_authorize_destination(path: Path, task_id: str) -> tuple[Optional[Path]
     from tools.file_tools import _check_general_file_write
 
     resolved = _tts_free_path(path)
-    blocked = _check_general_file_write([str(resolved)], task_id)
+    blocked = _check_general_file_write(
+        [str(resolved)], task_id, operation_type="tts_output")
     if blocked:
         return None, blocked
     return resolved, None
