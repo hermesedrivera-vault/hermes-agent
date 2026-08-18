@@ -239,6 +239,103 @@ def get_current_session_key(default: str = "default") -> str:
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
+# Task + subagent identity layered on top of session identity (Phase 3,
+# HERMES REFACTOR Step 9 / restored during the Step 52-55 MCP authorization
+# guard reconstruction). A session_key alone is NOT sufficient authorization
+# identity: two concurrent tasks (or a parent task and its spawned subagent)
+# sharing one session_key must not silently share an approval grant. These
+# contextvars are set by set_current_authorization_scope() at the same call
+# sites that already call set_current_session_key(); when unset (task_id
+# ""), get_current_authorization_key() collapses to the plain session key so
+# callers that haven't been wired up yet (legacy CLI/cron paths) keep their
+# existing behavior exactly.
+_approval_task_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_task_id",
+    default="",
+)
+_approval_subagent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_subagent_id",
+    default="",
+)
+
+
+def set_current_authorization_scope(
+    session_key: str,
+    task_id: str = "",
+    subagent_id: str = "",
+) -> tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]]:
+    """Bind session + task + subagent identity for the current context.
+
+    Phase 3 (HERMES REFACTOR Step 9): the canonical authorization identity
+    is session + task + subagent, not session alone. Callers that already
+    call set_current_session_key() should call this instead (it also sets
+    the session key), passing the calling task's effective_task_id and,
+    when running inside a spawned subagent, that subagent's _subagent_id.
+
+    Top-level tasks with no subagent MUST pass subagent_id="" explicitly
+    (the default) rather than omitting task scoping altogether — this keeps
+    "no subagent" a represented state rather than a silent collapse back to
+    session-only identity.
+    """
+    return (
+        _approval_session_key.set(session_key or ""),
+        _approval_task_id.set(task_id or ""),
+        _approval_subagent_id.set(subagent_id or ""),
+    )
+
+
+def reset_current_authorization_scope(
+    tokens: tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]],
+) -> None:
+    """Restore the prior session + task + subagent context."""
+    session_token, task_token, subagent_token = tokens
+    _approval_subagent_id.reset(subagent_token)
+    _approval_task_id.reset(task_token)
+    _approval_session_key.reset(session_token)
+
+
+def get_current_authorization_key(default: str = "default") -> str:
+    """Return the composed session+task+subagent authorization identity.
+
+    When no task_id has been set for the current context (legacy/unwired
+    callers — CLI, cron, older transports), this collapses to exactly
+    get_current_session_key()'s value, preserving existing behavior for
+    every call site that has not been migrated to
+    set_current_authorization_scope(). Once a caller sets task_id, grants
+    made under one task_id/subagent_id combination do not satisfy
+    is_approved() checks made under a different one, even within the same
+    session_key — this is the Phase 3 security boundary.
+    """
+    session_key = get_current_session_key(default=default)
+    task_id = _approval_task_id.get()
+    if not task_id:
+        return session_key
+    subagent_id = _approval_subagent_id.get()
+    return f"{session_key}::task={task_id}::sub={subagent_id}"
+
+
+def inherit_authorization_from_parent(
+    parent_authorization_key: str,
+    child_authorization_key: str,
+) -> None:
+    """Explicitly copy a parent's approved patterns onto a child's scope.
+
+    This is an intentional, one-time, opt-in copy — never an automatic
+    lookup-through. A subagent must not inherit its parent's grants merely
+    by sharing a session_key; inheritance only happens when a caller
+    (delegate_task, when inherit_parent_approvals=True) explicitly invokes
+    this function with both composed keys.
+    """
+    if not parent_authorization_key or not child_authorization_key:
+        return
+    with _lock:
+        parent_patterns = set(_session_approved.get(parent_authorization_key, set()))
+        if parent_patterns:
+            _session_approved.setdefault(child_authorization_key, set()).update(
+                parent_patterns
+            )
+
+
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:
@@ -3423,6 +3520,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    allow_permanent: bool = True,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3461,6 +3559,13 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        allow_permanent: When False, the [a]lways/permanent-allowlist option
+            is not offered and even if the underlying UI/adapter erroneously
+            returns an "always" choice, it is defensively downgraded to
+            session-only approval -- never calls approve_permanent()/
+            save_permanent_allowlist(). Used by check_mcp_call_guard() (and
+            any other guard that must never create a permanent grant) to
+            enforce that its approvals are session-scoped at maximum.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3472,7 +3577,9 @@ def _run_approval_gate(
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
+    # Phase 3: composed session+task+subagent identity -- collapses to plain
+    # session_key for callers not yet wired to set_current_authorization_scope.
+    session_key = get_current_authorization_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -3564,7 +3671,7 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
+                "allow_permanent": allow_permanent,
                 "allow_session": True,
             }
             decision = _await_gateway_decision(
@@ -3608,8 +3715,17 @@ def _run_approval_gate(
                 approve_session(session_key, pattern_key)
             elif choice == "always":
                 approve_session(session_key, pattern_key)
-                approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+                if allow_permanent:
+                    approve_permanent(pattern_key)
+                    save_permanent_allowlist(_permanent_approved)
+                else:
+                    logger.warning(
+                        "Approval choice 'always' received for pattern %r but "
+                        "allow_permanent=False for this authorization category "
+                        "-- defensively downgrading to session-scoped approval "
+                        "only. No permanent grant was created.",
+                        pattern_key,
+                    )
             return {"approved": True, "message": None}
 
         # No notify callback: interactive CLI with a panel callback should
@@ -3649,6 +3765,7 @@ def _run_approval_gate(
         surface="cli",
     )
     choice = prompt_dangerous_approval(display_target, description,
+                                       allow_permanent=allow_permanent,
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -3694,10 +3811,197 @@ def _run_approval_gate(
         approve_session(session_key, pattern_key)
     elif choice == "always":
         approve_session(session_key, pattern_key)
-        approve_permanent(pattern_key)
-        save_permanent_allowlist(_permanent_approved)
+        if allow_permanent:
+            approve_permanent(pattern_key)
+            save_permanent_allowlist(_permanent_approved)
+        else:
+            logger.warning(
+                "Approval choice 'always' received for pattern %r but "
+                "allow_permanent=False for this authorization category -- "
+                "defensively downgrading to session-scoped approval only. "
+                "No permanent grant was created.",
+                pattern_key,
+            )
 
     return {"approved": True, "message": None}
+
+
+# =========================================================================
+# MCP call authorization (Steps 52-55) -- fourth specialized guard, parallel
+# to check_all_command_guards/check_execute_code_guard/request_tool_approval.
+# Reconstructed after the 2026-08-17 `hermes update` reset discarded the
+# original commit; see the module-level history note in this docstring
+# section for why this mirrors (rather than cherry-picks) the historical
+# implementation.
+# =========================================================================
+
+# Conservative allowlist of argument-key names that may be treated as a
+# stable resource/target identifier for approval binding. Deliberately
+# narrow and literal: no semantic inference, no assumption that "path"
+# always means a destructive filesystem target, no reliance on tool
+# descriptions. If a call's arguments contain exactly one of these keys
+# with a non-empty scalar value, that becomes the binding target; anything
+# else falls back to a non-cacheable per-call approval (see
+# check_mcp_call_guard docstring).
+_MCP_TARGET_ARG_KEYS = (
+    "target", "resource", "resource_id", "id",
+    "path", "file_path", "filepath",
+    "url", "uri",
+    "recipient", "to",
+)
+
+
+def _extract_mcp_target(tool_args: dict) -> Optional[str]:
+    """Best-effort, deliberately conservative resource/target extraction.
+
+    Returns a normalized string when exactly one recognized target-shaped
+    key is present in ``tool_args`` with a non-empty scalar value, else
+    None. This is NOT a semantic safety judgment -- it only answers "is
+    there something stable enough to bind an approval to so a later call
+    with a DIFFERENT value doesn't silently reuse this one's approval."
+    Model-generated argument content is never treated as proof an action
+    is safe; it is only ever used as a binding key. Multiple candidate
+    keys are treated as ambiguous and fail closed to no-target rather than
+    guessing which one is authoritative.
+    """
+    if not isinstance(tool_args, dict):
+        return None
+    found = []
+    for key in _MCP_TARGET_ARG_KEYS:
+        if key in tool_args:
+            value = tool_args[key]
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                found.append((key, str(value).strip()))
+    if len(found) != 1:
+        return None
+    key, value = found[0]
+    return f"{key}={value}"
+
+
+def check_mcp_call_guard(
+    server_name: str,
+    tool_name: str,
+    tool_args: dict,
+) -> dict:
+    """Canonical authorization gate for write-capable MCP tool calls on
+    servers configured ``trust: untrusted`` (readOnlyHint=True tools and
+    trust=full servers never reach this function -- see
+    tools/mcp_tool.py's _trust_gate_check, which is unmodified except for
+    its call target in this one branch).
+
+    Reuses the existing decision core (_run_approval_gate) and identity
+    function (get_current_authorization_key) exactly as the other
+    canonical guards (check_dangerous_command / check_execute_code_guard /
+    request_tool_approval) do. Does NOT reuse a communication-endpoint
+    (channel, recipient) data model -- an arbitrary MCP side effect (file
+    write, cloud delete, SaaS setting change, financial transaction, ...)
+    frequently has no communication-endpoint-shaped recipient, and forcing
+    one through recipient normalization would either fail closed
+    uninformatively or silently pass through a comms-specific passthrough
+    branch with no real target-binding value.
+
+    Approval binding:
+      - When a stable target IS extracted (see _extract_mcp_target):
+        pattern_key = "mcp_action::{server}::{tool}::{target}" -- may be
+        reused by a LATER call with the identical
+        server+tool+target+session+task+subagent, per ordinary
+        _run_approval_gate/is_approved session-cache semantics.
+      - When NO stable target is extracted: pattern_key includes a random
+        per-call nonce, guaranteeing this decision is never looked up nor
+        stored for reuse by any other call, however identical the rest of
+        the call looks. Every invocation without an extractable target
+        requires fresh approval.
+
+    Identity: get_current_authorization_key() (session+task+subagent
+    composite) -- NEVER get_current_session_key(). A different task_id or
+    subagent_id within the same session is treated as a different
+    identity and cannot reuse another identity's approval.
+
+    Permanent ("always") approval is explicitly disabled
+    (allow_permanent=False) -- MCP side-effect approvals are session-scoped
+    at maximum.
+
+    Cron: participates directly in the canonical cron_mode branch inside
+    _run_approval_gate (fail_closed_when_no_human=True, cron_deny_message
+    below) -- a cron job under cron_mode: deny is blocked immediately with
+    no interactive prompt and no timeout-dependent behavior. This function
+    never calls request_elicitation_consent()'s CLI/TUI fallback.
+
+    Fail-closed: any exception, missing/invalid authorization identity, or
+    inability to construct a pattern_key results in denial, never approval.
+
+    Returns {"approved": bool, "message": str|None, ...} -- same contract
+    as the other canonical guards.
+    """
+    try:
+        session_key = get_current_authorization_key()
+        if not session_key or session_key == "default":
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: MCP tool call authorization requires a known "
+                    "session identity. No session identity was found; "
+                    f"'{tool_name}' on server '{server_name}' was NOT run."
+                ),
+            }
+
+        target = _extract_mcp_target(tool_args if isinstance(tool_args, dict) else {})
+        if target is not None:
+            pattern_key = f"mcp_action::{server_name}::{tool_name}::{target}"
+            display_target = f"{server_name}.{tool_name}({target})"
+        else:
+            # No confidently identifiable target: never cacheable. A random
+            # nonce guarantees this pattern_key can never collide with (and
+            # therefore never be satisfied by) any prior or future call,
+            # however similar the rest of the call looks.
+            nonce = os.urandom(8).hex()
+            pattern_key = f"mcp_action::{server_name}::{tool_name}::__no_target__::{nonce}"
+            display_target = f"{server_name}.{tool_name}(<no stable target>)"
+
+        description = (
+            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            "wants to run (write-capable; no readOnlyHint=true annotation)"
+        )
+
+        decision = _run_approval_gate(
+            pattern_key=pattern_key,
+            description=description,
+            display_target=display_target,
+            cron_deny_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but cron jobs run "
+                "without a user present to approve it. Find an alternative "
+                "approach that avoids this call. To allow untrusted MCP "
+                "write-capable calls in cron jobs, set "
+                "approvals.cron_mode: approve in config.yaml."
+            ),
+            single_query_deny_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but this is a "
+                "single-query (-q) session with no user present to answer "
+                "it. To allow this in single-query sessions, set "
+                "approvals.single_query_mode: approve in config.yaml."
+            ),
+            autoapprove_log_prefix="AUTO-APPROVED MCP call in non-interactive non-gateway context",
+            fail_closed_when_no_human=True,
+            allow_permanent=False,
+            no_human_block_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but no interactive user "
+                "or gateway is present to approve it. The call was NOT run."
+            ),
+        )
+        return decision
+    except Exception as exc:
+        logger.exception("check_mcp_call_guard raised -- failing CLOSED")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: MCP call authorization check failed with an "
+                f"internal error ({exc}). This is a fail-closed default -- "
+                f"'{tool_name}' on server '{server_name}' was NOT run."
+            ),
+        }
 
 
 def _should_skip_container_guards(env_type: str, has_host_access: bool = False) -> bool:

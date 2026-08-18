@@ -4358,7 +4358,7 @@ def _record_tool_trust_metadata(
                 hints[name] = _annotation_read_only_hint(tool)
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+def _trust_gate_check(server_name: str, tool_name: str, tool_args: Optional[dict] = None) -> Optional[str]:
     """Consult the approval path for write-capable tools on untrusted servers.
 
     Returns None when the call may proceed, or an error string (already
@@ -4371,25 +4371,16 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
         return None
 
-    # Lazy import mirrors the elicitation handler's pattern: tools.approval
-    # routes the prompt to whichever surface owns the session (CLI, TUI,
-    # Telegram, Slack, ...) and normalizes the answer.
+    # Steps 52-55: route through the canonical MCP authorization guard
+    # (session+task+subagent identity, server+tool+target-bound approval,
+    # cron-aware, fail-closed) rather than the session-only, single-shared-
+    # bucket request_elicitation_consent() CLI/TUI prompt. Lazy import
+    # mirrors the prior pattern: tools.approval routes the prompt to
+    # whichever surface owns the session (CLI, TUI, Telegram, Slack, ...).
     try:
-        from tools.approval import request_elicitation_consent
+        from tools.approval import check_mcp_call_guard
 
-        answer = request_elicitation_consent(
-            (
-                f"MCP tool '{tool_name}' on UNTRUSTED server "
-                f"'{server_name}' wants to run. This tool is write-capable "
-                f"(no readOnlyHint=true annotation) and may modify external "
-                f"state."
-            ),
-            (
-                f"Server '{server_name}' is configured 'trust: untrusted'. "
-                f"Approve to run '{tool_name}' once, or deny to block it."
-            ),
-            surface=f"mcp-trust/{server_name}",
-        )
+        decision = check_mcp_call_guard(server_name, tool_name, tool_args or {})
     except Exception as exc:
         logger.error(
             "MCP trust gate: approval check failed for %s.%s: %s",
@@ -4401,17 +4392,18 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
             f"(fail-closed)."
         )
 
-    if answer == "accept":
+    if decision.get("approved"):
         return None
     logger.info(
-        "MCP trust gate: user %s '%s' on untrusted server '%s'",
-        "cancelled" if answer == "cancel" else "denied",
-        tool_name, server_name,
+        "MCP trust gate: call to '%s' on untrusted server '%s' denied: %s",
+        tool_name, server_name, decision.get("message"),
     )
     return tool_error(
-        f"The user did not approve running write-capable MCP tool "
-        f"'{tool_name}' on untrusted server '{server_name}'. The command "
-        f"was NOT run. Do not retry without explicit user direction."
+        decision.get("message") or (
+            f"The user did not approve running write-capable MCP tool "
+            f"'{tool_name}' on untrusted server '{server_name}'. The command "
+            f"was NOT run. Do not retry without explicit user direction."
+        )
     )
 
 
@@ -5720,7 +5712,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
         # first-use spawn below. A denied call never touches the server.
-        gate_error = _trust_gate_check(server_name, tool_name)
+        gate_error = _trust_gate_check(server_name, tool_name, args)
         if gate_error is not None:
             return gate_error
 

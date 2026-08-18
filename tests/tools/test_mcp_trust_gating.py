@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import tools.approval as approval
 from tools import mcp_tool
 
 
@@ -91,13 +92,13 @@ class TestTrustGateAtCallTime:
     def test_write_capable_on_untrusted_server_requires_approval(
         self, fake_session
     ):
-        """Approval consulted; 'accept' lets the RPC through."""
+        """Approval consulted; approved=True lets the RPC through."""
         _set_trust("srv", "untrusted")
         # No readOnlyHint recorded for delete_repo → write-capable.
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
-            return_value="accept",
+            "tools.approval.check_mcp_call_guard",
+            return_value={"approved": True, "message": None},
         ) as consent:
             raw = handler({"repo": "x"})
         consent.assert_called_once()
@@ -105,12 +106,12 @@ class TestTrustGateAtCallTime:
         fake_session.call_tool.assert_awaited_once()
 
     def test_denied_approval_blocks_rpc(self, fake_session):
-        """'decline' blocks the call — the RPC must never fire."""
+        """approved=False blocks the call — the RPC must never fire."""
         _set_trust("srv", "untrusted")
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
-            return_value="decline",
+            "tools.approval.check_mcp_call_guard",
+            return_value={"approved": False, "message": "did not approve this call"},
         ):
             raw = handler({"repo": "x"})
         fake_session.call_tool.assert_not_awaited()
@@ -160,8 +161,8 @@ class TestTrustGateAtCallTime:
         _set_read_only("srv", "write_file", False)
         handler = mcp_tool._make_tool_handler("srv", "write_file", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
-            return_value="decline",
+            "tools.approval.check_mcp_call_guard",
+            return_value={"approved": False, "message": "denied"},
         ) as consent:
             handler({"path": "/etc/passwd"})
         consent.assert_called_once()
@@ -172,7 +173,7 @@ class TestTrustGateAtCallTime:
         _set_trust("srv", "untrusted")
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
+            "tools.approval.check_mcp_call_guard",
             side_effect=RuntimeError("approval backend down"),
         ):
             raw = handler({"repo": "x"})
@@ -245,3 +246,59 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+
+class TestCronDenialEndToEnd:
+    """Step 60/61: proves the cron-deny -> RPC-unreachable chain as ONE
+    uninterrupted path, closing the gap identified in the STEP 59/60 review
+    where cron denial was only tested up to the check_mcp_call_guard()
+    boundary in isolation.
+
+    This test does NOT mock check_mcp_call_guard() -- it exercises the REAL
+    check_mcp_call_guard() -> REAL _trust_gate_check() -> REAL
+    _make_tool_handler._handler() chain, with only the cron-context
+    predicates and the MCP session/transport mocked (same fake_session
+    fixture already used by every other test in this file). Proves
+    server.session.call_tool() is never awaited when approvals.cron_mode is
+    'deny'.
+    """
+
+    def test_cron_mode_deny_blocks_rpc_end_to_end(self, fake_session):
+        _set_trust("srv", "untrusted")
+        # No readOnlyHint recorded for delete_repo -> write-capable, so the
+        # real guard is actually reached (not short-circuited by an
+        # exemption before ever calling check_mcp_call_guard).
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+
+        tokens = approval.set_current_authorization_scope(
+            session_key="cron-e2e-session", task_id="", subagent_id=""
+        )
+        try:
+            with patch("tools.approval._is_cron_approval_context", return_value=True), \
+                 patch("tools.approval._get_cron_approval_mode", return_value="deny"), \
+                 patch("tools.approval._is_interactive_cli", return_value=False), \
+                 patch("tools.approval._is_gateway_approval_context", return_value=False), \
+                 patch(
+                     "tools.approval.prompt_dangerous_approval"
+                 ) as prompt:
+                # Real check_mcp_call_guard() is NOT mocked here -- this is
+                # the whole point of the test. Real _trust_gate_check() is
+                # NOT mocked. Only the cron-context predicates (so this
+                # test process doesn't need a real cron env var) and the
+                # human-prompt function (which must NEVER be called on this
+                # path) are patched.
+                raw = handler({"repo": "x"})
+        finally:
+            approval.reset_current_authorization_scope(tokens)
+
+        # The critical assertion: the real RPC call site inside _handler()
+        # was never reached.
+        fake_session.call_tool.assert_not_awaited()
+        # No interactive prompt was ever consulted -- the cron-deny branch
+        # inside the real _run_approval_gate() returns immediately, before
+        # any prompt logic.
+        prompt.assert_not_called()
+        # And the denial message reflects the cron-specific reason, proving
+        # the real cron_deny_message from check_mcp_call_guard() propagated
+        # all the way through _trust_gate_check()'s tool_error() wrapping.
+        assert "cron" in json.loads(raw)["error"].lower()
