@@ -256,6 +256,29 @@ async def send_sticker(
                      f"Use search_sticker first to discover available stickers.",
         }
 
+    # Outbound authorization gate: bind on the normalized chat_id (`target`),
+    # never on unnormalized/raw input. The sticker payload is catalog-
+    # restricted, so a stable descriptor is sufficient content for the
+    # guard's detection path -- the security-relevant binding is the
+    # recipient (channel_recipient_override). Must run before the external
+    # adapter send. (Step 47 design; Step 48 impl.)
+    from tools.approval import check_outbound_comm_guard
+    _sticker_descriptor = f"[sticker send: {sticker_obj.get('name') or sticker_obj.get('sticker_id') or 'random'}]"
+    try:
+        _approval = check_outbound_comm_guard(
+            "yuanbao",
+            _sticker_descriptor,
+            channel_recipient_override=("yuanbao", target),
+        )
+    except Exception as exc:
+        logger.exception("[yuanbao_tools] send_sticker outbound authorization error")
+        return {"success": False, "error": f"Outbound authorization check failed: {exc}"}
+    if not _approval.get("approved", False):
+        return {
+            "success": False,
+            "error": _approval.get("message") or "Outbound send blocked pending authorization.",
+        }
+
     try:
         result = await adapter.send_sticker(
             chat_id=target,
@@ -368,6 +391,25 @@ async def send_dm(
 
     if not resolved_user_id:
         return {"success": False, "error": "Could not resolve user_id"}
+
+    # Outbound authorization gate: bind on the FINAL resolved user_id, never
+    # on the raw nickname/name or group_code (Step 47 design; Step 48 impl).
+    # Must run before any external adapter send.
+    from tools.approval import check_outbound_comm_guard
+    try:
+        _approval = check_outbound_comm_guard(
+            "yuanbao",
+            message,
+            channel_recipient_override=("yuanbao", resolved_user_id),
+        )
+    except Exception as exc:
+        logger.exception("[yuanbao_tools] send_dm outbound authorization error")
+        return {"success": False, "error": f"Outbound authorization check failed: {exc}"}
+    if not _approval.get("approved", False):
+        return {
+            "success": False,
+            "error": _approval.get("message") or "Outbound send blocked pending authorization.",
+        }
 
     # Step 2: Send text DM + media
     chat_id = f"direct:{resolved_user_id}"

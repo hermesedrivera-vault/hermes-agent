@@ -9,8 +9,20 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+import tools.approval as approval
 from gateway.config import Platform
 from tools.send_message_tool import _parse_target_ref, send_message_tool
+
+
+@pytest.fixture
+def session_ctx():
+    tokens = approval.set_current_authorization_scope(
+        session_key="test_session_step50", task_id="t1", subagent_id=""
+    )
+    yield "test_session_step50"
+    approval.reset_current_authorization_scope(tokens)
 
 
 def _run_async_immediately(coro):
@@ -29,7 +41,7 @@ def test_e164_target_still_requires_phone_platform() -> None:
     assert _parse_target_ref("matrix", "+15551234567")[2] is False
 
 
-def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
+def test_send_message_routes_whatsapp_group_jid_without_home_fallback(session_ctx) -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(
         platforms={Platform.WHATSAPP: whatsapp_cfg},

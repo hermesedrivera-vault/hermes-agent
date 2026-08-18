@@ -25,6 +25,17 @@ def _reset_signal_scheduler():
     yield
     _reset_scheduler()
 
+import tools.approval as approval
+
+
+@pytest.fixture
+def session_ctx():
+    tokens = approval.set_current_authorization_scope(
+        session_key="test_session_step50", task_id="t1", subagent_id=""
+    )
+    yield "test_session_step50"
+    approval.reset_current_authorization_scope(tokens)
+
 from gateway.config import Platform
 from tools.send_message_tool import (
     _parse_target_ref,
@@ -276,7 +287,7 @@ def _ensure_slack_mock(monkeypatch):
 
 class TestSendMessageTool:
 
-    def test_ntfy_topic_target_bypasses_channel_directory(self):
+    def test_ntfy_topic_target_bypasses_channel_directory(self, session_ctx):
         ntfy_platform = Platform("ntfy")
         ntfy_cfg = SimpleNamespace(enabled=True, token=None, extra={"topic": "hermes-in"})
         config = SimpleNamespace(
@@ -312,7 +323,7 @@ class TestSendMessageTool:
         )
 
 
-    def test_media_tag_outside_allowed_roots_is_not_sent(self, tmp_path, monkeypatch):
+    def test_media_tag_outside_allowed_roots_is_not_sent(self, tmp_path, monkeypatch, session_ctx):
         # This test exercises the strict-allowlist path; force strict mode on
         # and disable recency trust so the freshly-written tmp_path file is
         # not auto-accepted by the trust window. (Recency trust is covered
@@ -350,7 +361,7 @@ class TestSendMessageTool:
             force_document=False,
         )
 
-    def test_top_level_send_failure_redacts_query_token(self):
+    def test_top_level_send_failure_redacts_query_token(self, session_ctx):
         config, _telegram_cfg = _make_config()
         leaked = "very-secret-query-token-123456"
 

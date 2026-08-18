@@ -383,6 +383,29 @@ def _handle_send(args, session_id=None):
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
+    # Outbound-communication authorization (Step 30): runs BEFORE the
+    # provenance gate below, in its OWN separate try/except so this gate's
+    # fail-CLOSED behavior can never be masked by (or merged with) the
+    # provenance gate's intentional fail-OPEN behavior a few lines down.
+    # Uses channel_recipient_override since send_message already knows the
+    # platform:target_ref structurally — no need to regex-detect it — but
+    # `target` is also passed as detection text so an email/SMS embedded in
+    # the message body itself is still caught by content-based detection.
+    from tools.approval import check_outbound_comm_guard
+    _outbound_parts = target.split(":", 1)
+    _outbound_platform = _outbound_parts[0].strip().lower() if _outbound_parts else ""
+    _outbound_target_ref = _outbound_parts[1].strip() if len(_outbound_parts) > 1 else ""
+    _outbound_decision = check_outbound_comm_guard(
+        "send_message",
+        f"{target}\n{message}",
+        channel_recipient_override=(_outbound_platform, _outbound_target_ref) if _outbound_target_ref else None,
+    )
+    if not _outbound_decision.get("approved", False):
+        return tool_error(
+            _outbound_decision.get("message")
+            or "BLOCKED: outbound communication authorization denied. Action NOT sent."
+        )
+
     try:
         from agent.provenance.gate import apply_provenance_gate
         _gate_block = apply_provenance_gate("send_message", args, session_id)
