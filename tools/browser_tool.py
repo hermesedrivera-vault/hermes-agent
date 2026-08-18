@@ -2637,6 +2637,63 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "declare_outbound_intent",
+        "description": "Declare an explicit, session-scoped target (channel + recipient) for an upcoming browser-mediated outbound send, before performing any browser mutation. Performs no external action and requires no approval by itself. While declared-but-unconfirmed, browser_click/browser_type/browser_press are BLOCKED -- call browser_confirm_outbound_action(channel, recipient) next to open an authorized send window.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Structured channel identifier (e.g. 'gmail', 'slack'), supplied explicitly -- never inferred from the page."},
+                "recipient": {"type": "string", "description": "Structured recipient identifier (e.g. an email address or handle), supplied explicitly -- never inferred from the page."},
+            },
+            "required": ["channel", "recipient"],
+        },
+    },
+    {
+        "name": "browser_confirm_outbound_action",
+        "description": "Authorize a browser-mediated outbound send previously declared via declare_outbound_intent(channel, recipient). Runs the same outbound-communication authorization gate as every other outbound path (session-scoped, fail-closed, no permanent grants). Only on approval does a bounded action-count/time window open in which browser_click/browser_type/browser_press are permitted for that recipient.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Must exactly match the channel used in the prior declare_outbound_intent call."},
+                "recipient": {"type": "string", "description": "Must exactly match (after normalization) the recipient used in the prior declare_outbound_intent call."},
+                "content": {"type": "string", "description": "Optional message content, passed to the authorization guard as additional detection text."},
+            },
+            "required": ["channel", "recipient"],
+        },
+    },
+    {
+        "name": "clear_outbound_intent",
+        "description": "Explicitly remove the active browser outbound intent/authorization for the current session, if any. Idempotent -- safe to call even when no intent exists.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "browser_send_message",
+        "description": "Send an outbound message via a browser-mediated channel (webmail, Slack/Discord/Teams web, etc.) under the same outbound-communication authorization gate used by send_message. Use this INSTEAD OF raw browser_click/browser_type/browser_press when you already know, structurally, the channel and recipient of a browser-driven send (e.g. composing and sending a webmail message on the user's instruction). Requires explicit 'channel' and 'recipient' arguments -- these are NOT inferred from page content. Authorization runs BEFORE any browser mutation; on denial, nothing is sent.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Structured channel identifier for the outbound send, e.g. 'gmail', 'slack', 'generic_web'. Must be supplied explicitly -- never derived from the page."
+                },
+                "recipient": {
+                    "type": "string",
+                    "description": "Structured recipient identifier (e.g. an email address or handle). Must be supplied explicitly -- never derived from the page."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The message content being sent."
+                },
+                "ref_sequence": {
+                    "type": "array",
+                    "description": "Minimal ordered list of browser actions needed to complete the send, executed only AFTER authorization succeeds. Each item: {\"action\": \"click\"|\"type\"|\"press\", \"ref\": \"@e5\" (for click/type), \"text\": \"...\" (for type), \"key\": \"Enter\" (for press)}.",
+                    "items": {"type": "object"}
+                }
+            },
+            "required": ["channel", "recipient", "content"]
+        }
+    },
+    {
         "name": "browser_get_images",
         "description": "Get a list of all images on the current page with their URLs and alt text. Useful for finding images to analyze with the vision tool. Requires browser_navigate to be called first.",
         "parameters": {
@@ -4248,6 +4305,14 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     if blocked is not None:
         return blocked
 
+    from tools.approval import check_browser_outbound_mutation_allowed
+    _intent_check = check_browser_outbound_mutation_allowed()
+    if not _intent_check.get("allowed", False):
+        return json.dumps({
+            "success": False,
+            "error": _intent_check.get("message", "BLOCKED: browser outbound intent state does not permit this mutation."),
+        }, ensure_ascii=False)
+
     # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
@@ -4288,6 +4353,14 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     blocked = _blocked_private_page_action(effective_task_id, "type")
     if blocked is not None:
         return blocked
+
+    from tools.approval import check_browser_outbound_mutation_allowed
+    _intent_check = check_browser_outbound_mutation_allowed()
+    if not _intent_check.get("allowed", False):
+        return json.dumps({
+            "success": False,
+            "error": _intent_check.get("message", "BLOCKED: browser outbound intent state does not permit this mutation."),
+        }, ensure_ascii=False)
 
     # Ensure ref starts with @
     if not ref.startswith("@"):
@@ -4445,6 +4518,13 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     blocked = _blocked_private_page_action(effective_task_id, "press")
     if blocked is not None:
         return blocked
+    from tools.approval import check_browser_outbound_mutation_allowed
+    _intent_check = check_browser_outbound_mutation_allowed()
+    if not _intent_check.get("allowed", False):
+        return json.dumps({
+            "success": False,
+            "error": _intent_check.get("message", "BLOCKED: browser outbound intent state does not permit this mutation."),
+        }, ensure_ascii=False)
     result = _run_browser_command(effective_task_id, "press", [key])
 
     if result.get("success"):
@@ -4459,6 +4539,193 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
             "error": result.get("error", f"Failed to press {key}")
         }
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+def declare_outbound_intent_tool(channel: str, recipient: str, task_id: Optional[str] = None) -> str:
+    """Declare an explicit, session-scoped outbound-send target for a
+    subsequent browser-mediated send. Performs NO external action, requests
+    NO approval, and creates NO permanent grant -- it only records where a
+    future send may target. ``channel``/``recipient`` must be supplied by
+    the caller; this tool never inspects DOM text, page structure, or
+    screenshots to infer either value.
+
+    A raw browser mutation (browser_click/browser_type/browser_press) is
+    BLOCKED while an intent is declared but not yet confirmed -- call
+    browser_confirm_outbound_action(channel, recipient) to open the
+    authorized send window before performing browser mutations.
+    """
+    from tools.approval import declare_outbound_intent as _declare
+    result = _declare(channel, recipient)
+    if not result.get("success"):
+        return tool_error(result.get("error") or "BLOCKED: outbound intent declaration failed.")
+    return json.dumps({
+        "success": True,
+        "channel": result.get("channel"),
+        "recipient": result.get("recipient"),
+        "expires_at": result.get("expires_at"),
+    }, ensure_ascii=False)
+
+
+def browser_confirm_outbound_action_tool(channel: str, recipient: str, content: str = "", task_id: Optional[str] = None) -> str:
+    """Authorize a browser-mediated outbound send previously declared via
+    declare_outbound_intent(channel, recipient). Runs the SAME
+    check_outbound_comm_guard() gate as every other outbound path (Step
+    30/32/34/36) -- recipient-bound, session-scoped, fail-closed,
+    allow_permanent=False. Only on approval does a bounded (TTL +
+    action-count) window open in which browser_click/browser_type/
+    browser_press are permitted.
+    """
+    from tools.approval import browser_confirm_outbound_action as _confirm
+    result = _confirm(channel, recipient, content or "")
+    if not result.get("approved"):
+        return tool_error(result.get("message") or "BLOCKED: outbound authorization denied.")
+    return json.dumps({
+        "success": True,
+        "expires_at": result.get("expires_at"),
+        "remaining_actions": result.get("remaining_actions"),
+    }, ensure_ascii=False)
+
+
+def clear_outbound_intent_tool(task_id: Optional[str] = None) -> str:
+    """Explicitly remove the active browser outbound intent (if any) for
+    the current session/task. Idempotent."""
+    from tools.approval import clear_outbound_intent as _clear
+    result = _clear()
+    return json.dumps({"success": True, "removed": result.get("removed", False)}, ensure_ascii=False)
+
+
+def browser_send_message(
+    channel: str,
+    recipient: str,
+    content: str,
+    ref_sequence: Optional[list] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Send an outbound message via a browser-mediated channel, under the
+    canonical Step 27 outbound authorization gate (Step 39/40).
+
+    This is a STRUCTURED capability, not a heuristic one: ``channel`` and
+    ``recipient`` are explicit function arguments supplied by the caller,
+    never inferred from DOM text, button labels, page structure, or
+    screenshots. It exists so that a browser-driven send can obtain the same
+    recipient-bound, session-scoped, fail-closed authorization that
+    ``send_message_tool.py`` already gets, WITHOUT requiring any DOM-text
+    heuristic (Step 38/39 explicitly rejected heuristic recipient inference).
+
+    Args:
+        channel: Structured channel identifier (e.g. "gmail", "slack",
+            "generic_web"). Supplied by the caller, never derived from the
+            page.
+        recipient: Structured recipient identifier (e.g. an email address
+            or handle). Supplied by the caller, never derived from the page.
+        content: The message content being sent. Passed to the outbound
+            guard as additional detection text (in case it embeds another
+            email/phone the caller didn't declare as the recipient), but the
+            authorization decision's recipient binding comes from the
+            structured ``channel``/``recipient`` arguments, not from
+            scanning this text.
+        ref_sequence: Minimal ordered list of browser actions needed to
+            complete the ALREADY-AUTHORIZED send, each a dict with keys
+            ``action`` ("click" or "type" or "press") and ``ref``/``text``/
+            ``key`` as appropriate, e.g.:
+            [{"action": "type", "ref": "@e3", "text": "<content>"},
+             {"action": "click", "ref": "@e7"}]
+            These are only executed AFTER approval — see below. This
+            function does not inspect page structure to build this list;
+            the caller (agent) must supply it, exactly as it would supply
+            individual browser_click/browser_type/browser_press calls.
+        task_id: Task identifier for session isolation.
+
+    Returns:
+        JSON string. On denial: the existing tool_error/denial shape from
+        check_outbound_comm_guard, and the ref_sequence is NEVER executed.
+        On approval: the ref_sequence is executed via the existing
+        browser_click/browser_type/browser_press primitives (unmodified),
+        and a summary of the executed steps is returned.
+    """
+    from tools.approval import check_outbound_comm_guard
+
+    if not channel or not isinstance(channel, str):
+        return tool_error("'channel' is required and must be a non-empty string")
+    if not recipient or not isinstance(recipient, str):
+        return tool_error("'recipient' is required and must be a non-empty string")
+
+    # Authorization runs in its OWN try/except, exactly like the pattern in
+    # send_message_tool.py's _handle_send(): this gate's fail-CLOSED
+    # behavior must never be masked or merged with any other gate's
+    # behavior. check_outbound_comm_guard() itself is fail-closed on any
+    # internal exception, missing recipient, missing session identity, or
+    # normalization failure -- that contract is reused verbatim, not
+    # reimplemented here.
+    try:
+        decision = check_outbound_comm_guard(
+            "browser_send",
+            content or "",
+            channel_recipient_override=(channel, recipient),
+        )
+    except Exception as exc:  # pragma: no cover -- defensive, guard itself is fail-closed
+        logger.exception("browser_send_message: outbound guard raised unexpectedly")
+        return tool_error(
+            "BLOCKED: outbound-communication authorization check failed with "
+            f"an internal error ({exc}). This is a fail-closed default -- "
+            "the browser send sequence was NOT executed."
+        )
+
+    if not decision.get("approved", False):
+        # Denial: ZERO browser mutation calls happen below this point.
+        return tool_error(
+            decision.get("message")
+            or "BLOCKED: outbound communication authorization denied. "
+            "Action NOT sent."
+        )
+
+    # --- Approved: execute the minimal, caller-supplied ref_sequence using
+    # the existing, UNMODIFIED browser primitives. No new DOM/CDP mutation
+    # logic is introduced here -- this simply dispatches to
+    # browser_click/browser_type/browser_press exactly as the agent would
+    # call them directly, after (not before) authorization succeeded. ---
+    executed: list = []
+    for step in ref_sequence or []:
+        action = (step or {}).get("action")
+        if action == "click":
+            step_result = browser_click(ref=step.get("ref", ""), task_id=task_id)
+        elif action == "type":
+            step_result = browser_type(
+                ref=step.get("ref", ""), text=step.get("text", ""), task_id=task_id
+            )
+        elif action == "press":
+            step_result = browser_press(key=step.get("key", ""), task_id=task_id)
+        else:
+            return tool_error(
+                f"Unsupported ref_sequence action {action!r}; expected "
+                "'click', 'type', or 'press'."
+            )
+        try:
+            parsed = json.loads(step_result)
+        except (TypeError, ValueError):
+            parsed = {"raw": step_result}
+        executed.append({"action": action, "result": parsed})
+        if isinstance(parsed, dict) and parsed.get("success") is False:
+            # Stop on first browser-level failure; authorization already
+            # succeeded, this is an execution-layer error, not a denial.
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Browser send sequence failed mid-execution",
+                    "executed": executed,
+                },
+                ensure_ascii=False,
+            )
+
+    return json.dumps(
+        {
+            "success": True,
+            "channel": channel,
+            "recipient": recipient,
+            "executed": executed,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _blocked_private_page_action(effective_task_id: str, action: str) -> Optional[str]:
@@ -6189,4 +6456,51 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+)
+registry.register(
+    name="declare_outbound_intent",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["declare_outbound_intent"],
+    handler=lambda args, **kw: declare_outbound_intent_tool(
+        channel=args.get("channel", ""),
+        recipient=args.get("recipient", ""),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🎯",
+)
+registry.register(
+    name="browser_confirm_outbound_action",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_confirm_outbound_action"],
+    handler=lambda args, **kw: browser_confirm_outbound_action_tool(
+        channel=args.get("channel", ""),
+        recipient=args.get("recipient", ""),
+        content=args.get("content", ""),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="✅",
+)
+registry.register(
+    name="clear_outbound_intent",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["clear_outbound_intent"],
+    handler=lambda args, **kw: clear_outbound_intent_tool(task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="🧹",
+)
+registry.register(
+    name="browser_send_message",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_send_message"],
+    handler=lambda args, **kw: browser_send_message(
+        channel=args.get("channel", ""),
+        recipient=args.get("recipient", ""),
+        content=args.get("content", ""),
+        ref_sequence=args.get("ref_sequence"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📤",
 )

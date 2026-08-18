@@ -2597,6 +2597,41 @@ _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
+# =========================================================================
+# Browser outbound intent state (Step 42/43) -- session-scoped, in-memory
+# only, never persisted, never a permanent grant. Keyed by
+# get_current_authorization_key() (session+task+subagent composite), NOT
+# the coarser get_current_session_key(), so intent cannot leak between
+# subagents/tasks sharing an outer session. See tools/browser_tool.py's
+# declare_outbound_intent / browser_confirm_outbound_action /
+# clear_outbound_intent for the state-machine transitions that read/write
+# this dict. Cleared by clear_session() above.
+#
+# Record shape: {
+#   "channel": str,               # opaque, reuses check_outbound_comm_guard's
+#                                  # channel_recipient_override convention
+#   "recipient": str,              # normalized via _normalize_recipient()
+#   "state": "declared" | "authorized",
+#   "declared_at": float,          # time.monotonic()
+#   "expires_at": float,           # time.monotonic() + TTL; set on declare,
+#                                  # RESET (not extended) on confirm to give
+#                                  # the authorized window its own bounded
+#                                  # lifetime rather than inheriting whatever
+#                                  # was left of the declare-phase TTL
+#   "remaining_actions": int | None,  # None until authorized; set to
+#                                     # _BROWSER_INTENT_MAX_ACTIONS on confirm
+# }
+_browser_outbound_intent: dict[str, dict] = {}
+
+# Conservative defaults per Step 42 open-question resolution (Step 43):
+# 10 minutes wall-clock, 5 raw browser mutations, for BOTH the declared
+# (unauthorized) and authorized phases. No project convention establishes
+# a stronger existing value, so these are new, deliberately conservative
+# constants -- not tuned against production usage data yet.
+_BROWSER_INTENT_DECLARE_TTL_SECONDS = 600
+_BROWSER_INTENT_AUTHORIZED_TTL_SECONDS = 600
+_BROWSER_INTENT_MAX_ACTIONS = 5
+
 
 # =========================================================================
 # Human-wait accounting (per session)
@@ -3020,6 +3055,7 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _browser_outbound_intent.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -3789,6 +3825,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    allow_permanent: bool = True,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3827,6 +3864,14 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        allow_permanent: When False, the [a]lways/permanent-allowlist option
+            is not offered and even if the underlying UI/adapter erroneously
+            returns an "always" choice, it is defensively downgraded to
+            session-only approval -- never calls approve_permanent()/
+            save_permanent_allowlist(). Used by check_outbound_comm_guard()
+            to enforce that outbound communication approvals are
+            session-scoped at maximum, per the Step 27/31 security
+            requirement.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3838,7 +3883,35 @@ def _run_approval_gate(
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
+    # Step 34 (Design B, closes the Step 33 finding): a pre-existing
+    # PERMANENT outbound_external_comm approval must not silently satisfy
+    # the generic is_approved() short-circuit below when running inside a
+    # cron job under cron_mode: deny -- otherwise cron_mode: deny becomes
+    # unenforceable for any recipient that was ever permanently approved
+    # (Step 32's allow_permanent=False only prevents NEW permanent grants
+    # from being created; it does not affect the LOOKUP of an
+    # already-existing one). This check is narrowly scoped to the
+    # outbound_external_comm:: pattern_key prefix ONLY -- it does not move
+    # the generic cron branch below, does not touch is_approved(), and does
+    # not affect check_dangerous_command()/request_tool_approval(), whose
+    # pattern_keys never use this prefix. Existing permanent grants are NOT
+    # revoked or purged -- interactive use of the same grant remains
+    # unaffected, since this check only fires under cron + deny.
+    if (
+        pattern_key.startswith("outbound_external_comm::")
+        and _is_cron_approval_context()
+        and _get_cron_approval_mode() == "deny"
+    ):
+        return {
+            "approved": False,
+            "message": cron_deny_message,
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    # Phase 3: composed session+task+subagent identity — collapses to plain
+    # session_key for callers not yet wired to set_current_authorization_scope.
+    session_key = get_current_authorization_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -3957,7 +4030,7 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
+                "allow_permanent": allow_permanent,
                 "allow_session": True,
             }
             decision = _await_gateway_decision(
@@ -4007,8 +4080,17 @@ def _run_approval_gate(
                 approve_session(session_key, pattern_key)
             elif choice == "always":
                 approve_session(session_key, pattern_key)
-                approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+                if allow_permanent:
+                    approve_permanent(pattern_key)
+                    save_permanent_allowlist(_permanent_approved)
+                else:
+                    logger.warning(
+                        "Approval choice 'always' received for pattern %r but "
+                        "allow_permanent=False for this authorization category "
+                        "-- defensively downgrading to session-scoped approval "
+                        "only. No permanent grant was created.",
+                        pattern_key,
+                    )
             return {"approved": True, "message": None}
 
         # No notify callback: interactive CLI with a panel callback should
@@ -4048,6 +4130,7 @@ def _run_approval_gate(
         surface="cli",
     )
     choice = prompt_dangerous_approval(display_target, description,
+                                       allow_permanent=allow_permanent,
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -4093,8 +4176,17 @@ def _run_approval_gate(
         approve_session(session_key, pattern_key)
     elif choice == "always":
         approve_session(session_key, pattern_key)
-        approve_permanent(pattern_key)
-        save_permanent_allowlist(_permanent_approved)
+        if allow_permanent:
+            approve_permanent(pattern_key)
+            save_permanent_allowlist(_permanent_approved)
+        else:
+            logger.warning(
+                "Approval choice 'always' received for pattern %r but "
+                "allow_permanent=False for this authorization category -- "
+                "defensively downgrading to session-scoped approval only. "
+                "No permanent grant was created.",
+                pattern_key,
+            )
 
     return {"approved": True, "message": None}
 
@@ -4111,6 +4203,740 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     if env_type == "docker":
         return not has_host_access
     return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
+
+
+_EMAIL_SEND_VERBS = re.compile(
+    r"(\.messages\(\)\.send\s*\(|\bsendmail\s*\(|\.send_message\s*\()",
+    re.IGNORECASE,
+)
+_EMAIL_ADDR_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_SMS_SEND_VERBS = re.compile(
+    r"\b(twilio|messages\.create|send_sms|sendSms)\b", re.IGNORECASE
+)
+_PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
+_OUTBOUND_SELF_ADDRESSES = {"ed.rivera@gmail.com", "hermes.ed.rivera@gmail.com"}
+
+
+def detect_outbound_comm(text):
+    """Detect an outbound EXTERNAL email/SMS send signal in free text.
+
+    Content-based detector: catches an email/SMS send regardless of which
+    tool (terminal, execute_code, send_message) carries the text. Ported
+    from agent/provenance/approval_gate.py's detect_outbound_comm (that
+    module's version is unwired/unused in production; this is the wired
+    copy). Returns {"channel": "email"|"sms", "recipients": [...]}, or None.
+    """
+    if not text:
+        return None
+    if _EMAIL_SEND_VERBS.search(text):
+        recipients = _EMAIL_ADDR_RE.findall(text)
+        external = sorted({r for r in recipients if r.lower() not in _OUTBOUND_SELF_ADDRESSES})
+        if external:
+            return {"channel": "email", "recipients": external}
+    if _SMS_SEND_VERBS.search(text):
+        phones = sorted(set(_PHONE_RE.findall(text)))
+        if phones:
+            return {"channel": "sms", "recipients": phones}
+    return None
+
+
+def _normalize_recipient(channel, recipient):
+    """Normalize a detected recipient to a canonical string, or None if it
+    cannot be reliably normalized (caller MUST fail closed on None, never
+    fall back to a channel-only approval key -- that would reintroduce the
+    exact non-recipient-bound gap this design exists to close).
+    """
+    if not recipient or not isinstance(recipient, str):
+        return None
+    if channel not in ("email", "sms"):
+        # Ordinary platform channels (telegram/discord/slack/etc.) are the
+        # agent's normal operation, not the email/SMS-style external comms
+        # this gate targets. Pass the recipient through with light
+        # normalization rather than failing closed on every platform send.
+        stripped = recipient.strip()
+        return stripped if stripped else None
+    if channel == "email":
+        addr = recipient.strip().lower()
+        if "@" not in addr:
+            return None
+        local, _, domain = addr.rpartition("@")
+        if domain in ("gmail.com", "googlemail.com") and "+" in local:
+            local = local.split("+", 1)[0]
+        if not local or not domain:
+            return None
+        return f"{local}@{domain}"
+    if channel == "sms":
+        digits = re.sub(r"[^0-9+]", "", recipient)
+        if digits.startswith("+"):
+            core = digits[1:]
+        else:
+            core = digits
+        if len(core) == 10 and core.isdigit():
+            return f"+1{core}"
+        if len(core) == 11 and core.startswith("1") and core.isdigit():
+            return f"+{core}"
+        if digits.startswith("+") and len(core) >= 10 and core.isdigit():
+            return f"+{core}"
+        return None
+    return None  # unknown channel: fail closed, do not guess
+
+
+def _get_outbound_comm_mode():
+    """Read approvals.outbound_comm_mode from config; default 'shadow'.
+
+    'shadow': detection/normalization run for real, but a would-be-blocked
+    decision is logged and ALLOWED (approved=True) rather than blocked --
+    used to measure false-positive rate before enforcing. 'enforce': a
+    would-be-blocked decision actually blocks. This switch does NOT affect
+    the fail-closed error cases below (detector exception, normalization
+    failure, missing recipient, missing session identity, approval-store
+    failure) -- those ALWAYS fail closed regardless of shadow/enforce; only
+    the ordinary "detected, needs human approval" path is shadow-gated.
+    Interacts with approvals.mode (manual/smart/off) and approvals.cron_mode
+    exactly as check_dangerous_command does -- yolo/mode=off bypasses this
+    gate entirely upstream (see check_all_command_guards/check_execute_code_guard
+    call sites), and cron_mode is honored inside _run_approval_gate's own
+    cron branch via fail_closed_when_no_human below.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+        mode = ((config.get("approvals", {}) or {}).get("outbound_comm_mode") or "shadow")
+        return mode if mode in ("shadow", "enforce") else "shadow"
+    except Exception:
+        return "shadow"
+
+
+def check_outbound_comm_guard(tool_name, text_for_detection, channel_recipient_override=None):
+    """Canonical outbound-external-communication authorization gate.
+
+    Detects an outbound email/SMS send in `text_for_detection` (or uses
+    `channel_recipient_override=(channel, recipient)` when the caller
+    already knows the target structurally, e.g. send_message's own
+    platform:chat_id parsing) and requires a recipient-bound, session-scoped
+    approval before allowing it. FAIL-CLOSED is non-negotiable: any
+    exception, normalization failure, missing recipient, or missing session
+    identity blocks the action regardless of shadow/enforce mode -- only the
+    ordinary "needs human approval" path is affected by outbound_comm_mode.
+
+    Returns {"approved": bool, "message": str|None, ...} -- same contract as
+    check_dangerous_command/check_all_command_guards.
+    """
+    try:
+        if channel_recipient_override is not None:
+            channel, raw_recipient = channel_recipient_override
+            detection = {"channel": channel, "recipients": [raw_recipient]} if raw_recipient else None
+        else:
+            detection = detect_outbound_comm(text_for_detection)
+
+        if not detection:
+            return {"approved": True, "message": None}
+
+        channel = detection.get("channel")
+        raw_recipients = detection.get("recipients") or []
+        if not raw_recipients:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: outbound communication detected but no recipient "
+                    "could be extracted. Action NOT sent."
+                ),
+            }
+
+        normalized = []
+        for r in raw_recipients:
+            n = _normalize_recipient(channel, r)
+            if n is None:
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: outbound communication detected but recipient "
+                        f"'{r}' could not be reliably normalized/verified. "
+                        "Action NOT sent."
+                    ),
+                }
+            normalized.append(n)
+
+        session_key = get_current_authorization_key()
+        if session_key == "default":
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: outbound communication authorization requires a "
+                    "known session identity. No session identity was found; "
+                    "action NOT sent."
+                ),
+            }
+
+        recipient_key = ",".join(sorted(set(normalized)))
+        pattern_key = f"outbound_external_comm::{channel}::{recipient_key}"
+        description = f"Outbound {channel} communication to {recipient_key}"
+
+        mode = _get_outbound_comm_mode()
+
+        decision = _run_approval_gate(
+            pattern_key=pattern_key,
+            description=description,
+            display_target=text_for_detection or recipient_key,
+            cron_deny_message=(
+                f"BLOCKED: Outbound {channel} communication to {recipient_key} "
+                "but cron jobs run without a user present to approve it. "
+                "Find an alternative approach that avoids this send. "
+                "To allow outbound communication in cron jobs, set "
+                "approvals.cron_mode: approve in config.yaml."
+            ),
+            autoapprove_log_prefix="AUTO-APPROVED outbound communication in non-interactive non-gateway context",
+            fail_closed_when_no_human=True,
+            allow_permanent=False,
+            no_human_block_message=(
+                f"BLOCKED: outbound {channel} communication to {recipient_key} "
+                "requires approval but no interactive user or gateway is "
+                "present to approve it. Action NOT sent."
+            ),
+        )
+
+        if not decision.get("approved", False) and mode == "shadow":
+            logger.warning(
+                "SHADOW MODE: outbound_comm_mode=shadow -- would have BLOCKED "
+                "%s (pattern: %s): %s. Allowing because shadow mode is active.",
+                tool_name, pattern_key, decision.get("message"),
+            )
+            return {"approved": True, "message": None, "shadow_would_have_blocked": True}
+
+        if decision.get("approved") and pattern_key in _permanent_approved:
+            # KNOWN LIMITATION (accepted, non-blocking): _run_approval_gate()'s
+            # gateway-interactive branch hardcodes allow_permanent=True with no
+            # parameter to suppress the "always" option for this category. We
+            # do not un-approve an already-granted, human-approved send -- that
+            # would be its own bug -- we only log so this residual gap stays
+            # visible for a future _run_approval_gate() enhancement.
+            logger.warning(
+                "Outbound communication pattern_key %r was granted PERMANENT "
+                "('always') approval via the shared approval gateway UI. "
+                "Permanent approval is not intended for outbound_external_comm "
+                "(session-scope should be the maximum lifetime) but "
+                "_run_approval_gate() has no parameter to suppress the 'always' "
+                "option -- this is a documented, accepted residual limitation, "
+                "not a bug. The already-granted approval is not revoked.",
+                pattern_key,
+            )
+
+        return decision
+    except Exception as exc:
+        logger.exception("check_outbound_comm_guard raised -- failing CLOSED")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: outbound-communication authorization check failed "
+                f"with an internal error ({exc}). This is a fail-closed "
+                "default -- the action was NOT sent."
+            ),
+        }
+
+
+# =========================================================================
+# MCP call authorization (Step 52) — fourth specialized guard, parallel to
+# check_all_command_guards/check_execute_code_guard/check_outbound_comm_guard.
+# =========================================================================
+
+# Conservative allowlist of argument-key names that may be treated as a
+# stable resource/target identifier for approval binding. Deliberately
+# narrow and literal: no semantic inference, no assumption that "path"
+# always means a destructive filesystem target, no reliance on tool
+# descriptions. If a call's arguments contain exactly one of these keys
+# with a non-empty scalar value, that becomes the binding target; anything
+# else falls back to a non-cacheable per-call approval (see
+# check_mcp_call_guard docstring).
+_MCP_TARGET_ARG_KEYS = (
+    "target", "resource", "resource_id", "id",
+    "path", "file_path", "filepath",
+    "url", "uri",
+    "recipient", "to",
+)
+
+
+def _extract_mcp_target(tool_args: dict) -> Optional[str]:
+    """Best-effort, deliberately conservative resource/target extraction.
+
+    Returns a normalized string when exactly one recognized target-shaped
+    key is present in ``tool_args`` with a non-empty scalar value, else
+    None. This is NOT a semantic safety judgment -- it only answers "is
+    there something stable enough to bind an approval to so a later call
+    with a DIFFERENT value doesn't silently reuse this one's approval."
+    Model-generated argument content is never treated as proof an action
+    is safe; it is only ever used as a binding key. Multiple candidate
+    keys are treated as ambiguous and fail closed to no-target rather than
+    guessing which one is authoritative.
+    """
+    if not isinstance(tool_args, dict):
+        return None
+    found = []
+    for key in _MCP_TARGET_ARG_KEYS:
+        if key in tool_args:
+            value = tool_args[key]
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                found.append((key, str(value).strip()))
+    if len(found) != 1:
+        return None
+    key, value = found[0]
+    return f"{key}={value}"
+
+
+def check_mcp_call_guard(
+    server_name: str,
+    tool_name: str,
+    tool_args: dict,
+) -> dict:
+    """Canonical authorization gate for write-capable MCP tool calls on
+    servers configured ``trust: untrusted`` (readOnlyHint=True tools and
+    trust=full servers never reach this function -- see
+    tools/mcp_tool.py's _trust_gate_check, which is unmodified except for
+    its call target in this one branch).
+
+    Reuses the existing decision core (_run_approval_gate) and identity
+    function (get_current_authorization_key) exactly as
+    check_outbound_comm_guard/check_execute_code_guard do. Does NOT reuse
+    check_outbound_comm_guard's (channel, recipient) data model -- per the
+    Step 51 design report, an arbitrary MCP side effect (file write, cloud
+    delete, SaaS setting change, financial transaction, ...) frequently has
+    no communication-endpoint-shaped recipient, and forcing one through
+    recipient normalization would either fail closed uninformatively or
+    silently pass through the guard's comms-specific passthrough branch
+    with no real target-binding value.
+
+    Approval binding:
+      - When a stable target IS extracted (see _extract_mcp_target):
+        pattern_key = "mcp_action::{server}::{tool}::{target}" -- may be
+        reused by a LATER call with the identical
+        server+tool+target+session+task+subagent, per ordinary
+        _run_approval_gate/is_approved session-cache semantics.
+      - When NO stable target is extracted: pattern_key includes a random
+        per-call nonce, guaranteeing this decision is never looked up nor
+        stored for reuse by any other call, however identical the rest of
+        the call looks. Every invocation without an extractable target
+        requires fresh approval.
+
+    Identity: get_current_authorization_key() (session+task+subagent
+    composite) -- NEVER get_current_session_key(). A different task_id or
+    subagent_id within the same session is treated as a different
+    identity and cannot reuse another identity's approval.
+
+    Permanent ("always") approval is explicitly disabled
+    (allow_permanent=False) -- MCP side-effect approvals are session-scoped
+    at maximum, matching the existing outbound_external_comm precedent.
+
+    Cron: participates directly in the canonical cron_mode branch inside
+    _run_approval_gate (fail_closed_when_no_human=True, cron_deny_message
+    below) -- a cron job under cron_mode: deny is blocked immediately with
+    no interactive prompt and no timeout-dependent behavior. This function
+    never calls request_elicitation_consent()'s CLI/TUI fallback.
+
+    Fail-closed: any exception, missing/invalid authorization identity, or
+    inability to construct a pattern_key results in denial, never approval.
+
+    Returns {"approved": bool, "message": str|None, ...} -- same contract
+    as the other three canonical guards.
+    """
+    try:
+        session_key = get_current_authorization_key()
+        if not session_key or session_key == "default":
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: MCP tool call authorization requires a known "
+                    "session identity. No session identity was found; "
+                    f"'{tool_name}' on server '{server_name}' was NOT run."
+                ),
+            }
+
+        target = _extract_mcp_target(tool_args if isinstance(tool_args, dict) else {})
+        if target is not None:
+            pattern_key = f"mcp_action::{server_name}::{tool_name}::{target}"
+            display_target = f"{server_name}.{tool_name}({target})"
+        else:
+            # No confidently identifiable target: never cacheable. A random
+            # nonce guarantees this pattern_key can never collide with (and
+            # therefore never be satisfied by) any prior or future call,
+            # however similar the rest of the call looks.
+            nonce = os.urandom(8).hex()
+            pattern_key = f"mcp_action::{server_name}::{tool_name}::__no_target__::{nonce}"
+            display_target = f"{server_name}.{tool_name}(<no stable target>)"
+
+        description = (
+            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            "wants to run (write-capable; no readOnlyHint=true annotation)"
+        )
+
+        decision = _run_approval_gate(
+            pattern_key=pattern_key,
+            description=description,
+            display_target=display_target,
+            cron_deny_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but cron jobs run "
+                "without a user present to approve it. Find an alternative "
+                "approach that avoids this call. To allow untrusted MCP "
+                "write-capable calls in cron jobs, set "
+                "approvals.cron_mode: approve in config.yaml."
+            ),
+            autoapprove_log_prefix="AUTO-APPROVED MCP call in non-interactive non-gateway context",
+            fail_closed_when_no_human=True,
+            allow_permanent=False,
+            no_human_block_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but no interactive user "
+                "or gateway is present to approve it. The call was NOT run."
+            ),
+        )
+        return decision
+    except Exception as exc:
+        logger.exception("check_mcp_call_guard raised -- failing CLOSED")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: MCP call authorization check failed with an "
+                f"internal error ({exc}). This is a fail-closed default -- "
+                f"'{tool_name}' on server '{server_name}' was NOT run."
+            ),
+        }
+
+
+# =========================================================================
+# Browser outbound intent state machine (Step 42/43)
+# =========================================================================
+#
+# NO_INTENT --declare_outbound_intent()--> INTENT_DECLARED
+#   --browser_confirm_outbound_action()+approval--> SEND_WINDOW_OPEN
+#   --TTL / action-count exhaustion / clear_outbound_intent()--> NO_INTENT
+#
+# Security property this exists to enforce: INTENT_DECLARED alone NEVER
+# unlocks browser_click/browser_type/browser_press. Only a real, successful
+# check_outbound_comm_guard() decision (same fail-closed gate Step 30/32/34/36
+# already established) transitions declared -> authorized. This module owns
+# state; tools/browser_tool.py owns the tool-facing wrappers/registrations
+# and the browser_click/browser_type/browser_press consultation hook.
+
+
+def declare_outbound_intent(channel: str, recipient: str) -> dict:
+    """Record an explicit, session-scoped declaration of an upcoming
+    browser-mediated outbound send target. Performs NO external action,
+    requests NO approval, creates NO permanent grant, and sends nothing --
+    it only records *where* a future send may target, using the SAME
+    recipient normalizer check_outbound_comm_guard() itself uses, so the
+    later confirmation check compares like-for-like.
+
+    One active intent per get_current_authorization_key(): a new
+    declaration replaces any existing one for that key (declared or
+    already-authorized) rather than stacking multiple targets.
+
+    Returns {"success": bool, "error": str|None, "channel": str|None,
+    "recipient": str|None, "expires_at": float|None}.
+    """
+    if not channel or not isinstance(channel, str):
+        return {"success": False, "error": "'channel' is required and must be a non-empty string"}
+    if not recipient or not isinstance(recipient, str):
+        return {"success": False, "error": "'recipient' is required and must be a non-empty string"}
+
+    try:
+        normalized = _normalize_recipient(channel, recipient)
+    except Exception as exc:
+        logger.exception("declare_outbound_intent: normalization raised unexpectedly")
+        return {"success": False, "error": f"BLOCKED: recipient normalization failed ({exc})."}
+
+    if normalized is None:
+        return {
+            "success": False,
+            "error": (
+                f"BLOCKED: recipient '{recipient}' for channel '{channel}' could not be "
+                "reliably normalized. Intent NOT recorded."
+            ),
+        }
+
+    auth_key = get_current_authorization_key()
+    if auth_key == "default":
+        return {
+            "success": False,
+            "error": (
+                "BLOCKED: outbound intent declaration requires a known session "
+                "identity. No session identity was found; intent NOT recorded."
+            ),
+        }
+
+    now = time.monotonic()
+    record = {
+        "channel": channel,
+        "recipient": normalized,
+        "state": "declared",
+        "declared_at": now,
+        "expires_at": now + _BROWSER_INTENT_DECLARE_TTL_SECONDS,
+        "remaining_actions": None,
+    }
+    with _lock:
+        _browser_outbound_intent[auth_key] = record
+
+    return {
+        "success": True,
+        "error": None,
+        "channel": channel,
+        "recipient": normalized,
+        "expires_at": record["expires_at"],
+    }
+
+
+def _get_browser_outbound_intent(auth_key: str) -> Optional[dict]:
+    """Fail-closed lookup: returns None (== no_intent) on any error, missing
+    key, or expired record. Never raises."""
+    if not auth_key or auth_key == "default":
+        return None
+    try:
+        with _lock:
+            record = _browser_outbound_intent.get(auth_key)
+        if record is None:
+            return None
+        if time.monotonic() >= record.get("expires_at", 0):
+            # Expired -- do not silently renew. Remove it so a stale record
+            # can't be mistaken for a live one by a later lookup either.
+            with _lock:
+                _browser_outbound_intent.pop(auth_key, None)
+            return None
+        return record
+    except Exception:
+        logger.exception("_get_browser_outbound_intent: lookup raised -- treating as no_intent (fail closed)")
+        return None
+
+
+def browser_confirm_outbound_action(channel: str, recipient: str, content: str = "") -> dict:
+    """Authorization boundary for browser-mediated outbound sends. Requires
+    a live, matching INTENT_DECLARED record, then runs the EXISTING
+    check_outbound_comm_guard() -- the same fail-closed, session-scoped,
+    allow_permanent=False, cron-aware gate every other outbound path uses.
+    Only on approval does the intent transition declared -> authorized and
+    open a bounded (TTL + action-count) window that browser_click/
+    browser_type/browser_press consult.
+
+    Declaring intent is NEVER sufficient by itself -- this function is the
+    only place the declared -> authorized transition can happen, and it
+    always re-runs the real authorization check; it does not implement a
+    second/parallel approval mechanism.
+
+    Returns {"approved": bool, "message": str|None, "expires_at": float|None,
+    "remaining_actions": int|None}.
+    """
+    if not channel or not isinstance(channel, str):
+        return {"approved": False, "message": "BLOCKED: 'channel' is required and must be a non-empty string."}
+    if not recipient or not isinstance(recipient, str):
+        return {"approved": False, "message": "BLOCKED: 'recipient' is required and must be a non-empty string."}
+
+    auth_key = get_current_authorization_key()
+    if auth_key == "default":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: browser outbound confirmation requires a known session "
+                "identity. No session identity was found."
+            ),
+        }
+
+    try:
+        normalized_confirm = _normalize_recipient(channel, recipient)
+    except Exception as exc:
+        logger.exception("browser_confirm_outbound_action: normalization raised unexpectedly")
+        return {"approved": False, "message": f"BLOCKED: recipient normalization failed ({exc})."}
+
+    if normalized_confirm is None:
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: recipient '{recipient}' for channel '{channel}' could not be "
+                "reliably normalized."
+            ),
+        }
+
+    record = _get_browser_outbound_intent(auth_key)
+    if record is None:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: no live outbound intent found for this session/task. "
+                "Call declare_outbound_intent(channel, recipient) first."
+            ),
+        }
+
+    if record.get("channel") != channel or record.get("recipient") != normalized_confirm:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: confirmation channel/recipient does not match the "
+                "declared intent. Intent was NOT authorized for this target."
+            ),
+        }
+
+    try:
+        decision = check_outbound_comm_guard(
+            "browser_send",
+            content or "",
+            channel_recipient_override=(channel, normalized_confirm),
+        )
+    except Exception as exc:  # pragma: no cover -- defensive; guard is fail-closed itself
+        logger.exception("browser_confirm_outbound_action: outbound guard raised unexpectedly")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: outbound-communication authorization check failed with "
+                f"an internal error ({exc})."
+            ),
+        }
+
+    if not decision.get("approved", False):
+        return {
+            "approved": False,
+            "message": decision.get("message") or "BLOCKED: outbound authorization denied.",
+        }
+
+    now = time.monotonic()
+    authorized_record = {
+        "channel": channel,
+        "recipient": normalized_confirm,
+        "state": "authorized",
+        "declared_at": record.get("declared_at", now),
+        "expires_at": now + _BROWSER_INTENT_AUTHORIZED_TTL_SECONDS,
+        "remaining_actions": _BROWSER_INTENT_MAX_ACTIONS,
+    }
+    with _lock:
+        # Re-check the record is still the one we evaluated (best-effort
+        # anti-race; a concurrent clear/redeclare between lookup and here
+        # would mean this confirmation is stale) before committing.
+        current = _browser_outbound_intent.get(auth_key)
+        if current is not record and current is not None and (
+            current.get("channel") != record.get("channel")
+            or current.get("recipient") != record.get("recipient")
+        ):
+            return {
+                "approved": False,
+                "message": "BLOCKED: intent changed during confirmation. Re-declare and retry.",
+            }
+        _browser_outbound_intent[auth_key] = authorized_record
+
+    return {
+        "approved": True,
+        "message": None,
+        "expires_at": authorized_record["expires_at"],
+        "remaining_actions": authorized_record["remaining_actions"],
+    }
+
+
+def clear_outbound_intent() -> dict:
+    """Explicitly remove the active browser outbound intent (if any) for
+    the current authorization key. Always succeeds (idempotent); returns
+    whether an intent was actually present to remove."""
+    auth_key = get_current_authorization_key()
+    if auth_key == "default":
+        return {"success": True, "removed": False}
+    with _lock:
+        removed = _browser_outbound_intent.pop(auth_key, None) is not None
+    return {"success": True, "removed": removed}
+
+
+def check_browser_outbound_mutation_allowed() -> dict:
+    """Consulted by browser_click/browser_type/browser_press (Step 43).
+    Non-heuristic: makes NO attempt to inspect DOM/page content -- it only
+    asks "does a live, authorized intent window exist for this
+    session/task?" Three outcomes:
+
+      no_intent    -> {"allowed": True, "state": "no_intent"}       (CASE A:
+                        preserves current, unrestricted behavior exactly)
+      declared     -> {"allowed": False, "state": "declared", ...}  (CASE B:
+                        FAIL CLOSED -- intent exists but was never confirmed)
+      authorized   -> {"allowed": True, "state": "authorized", ...} and
+                       decrements remaining_actions (CASE C), OR
+                       {"allowed": False, "state": "expired", ...} if the
+                       window's TTL/action-count has been exhausted (CASE D)
+
+    Any lookup/state error fails CLOSED as {"allowed": False,
+    "state": "error", ...} (CASE E) -- an intent existing but being
+    unreadable is never treated as "no_intent"/unrestricted.
+    """
+    auth_key = get_current_authorization_key()
+    try:
+        if not auth_key or auth_key == "default":
+            with _lock:
+                has_any = bool(_browser_outbound_intent)
+            # No session identity at all: if there is genuinely no intent
+            # state anywhere (the overwhelmingly common case -- CLI/tests/
+            # unmigrated callers), preserve today's unrestricted behavior.
+            # We cannot safely look up "this session's" intent without an
+            # identity, so we do not invent one; but we also must not let a
+            # missing identity silently defeat an intent that some OTHER
+            # call path already declared under a resolvable identity.
+            if not has_any:
+                return {"allowed": True, "state": "no_intent"}
+            return {
+                "allowed": False,
+                "state": "error",
+                "message": "BLOCKED: browser outbound intent state exists but no session identity is available to resolve it (fail closed).",
+            }
+
+        with _lock:
+            record = _browser_outbound_intent.get(auth_key)
+
+        if record is None:
+            return {"allowed": True, "state": "no_intent"}
+
+        if time.monotonic() >= record.get("expires_at", 0):
+            with _lock:
+                # Only pop if it's still the same expired record (avoid
+                # clobbering a concurrent fresh declare/confirm).
+                current = _browser_outbound_intent.get(auth_key)
+                if current is record:
+                    _browser_outbound_intent.pop(auth_key, None)
+            return {
+                "allowed": False,
+                "state": "expired",
+                "message": "BLOCKED: browser outbound authorization window has expired. Re-confirm via browser_confirm_outbound_action().",
+            }
+
+        state = record.get("state")
+        if state == "declared":
+            return {
+                "allowed": False,
+                "state": "declared",
+                "message": (
+                    "BLOCKED: an outbound intent is declared but not yet authorized. "
+                    "Call browser_confirm_outbound_action(channel, recipient) before "
+                    "performing browser mutations."
+                ),
+            }
+        if state == "authorized":
+            remaining = record.get("remaining_actions")
+            if not isinstance(remaining, int) or remaining <= 0:
+                with _lock:
+                    current = _browser_outbound_intent.get(auth_key)
+                    if current is record:
+                        _browser_outbound_intent.pop(auth_key, None)
+                return {
+                    "allowed": False,
+                    "state": "expired",
+                    "message": "BLOCKED: browser outbound authorized action budget exhausted. Re-confirm via browser_confirm_outbound_action().",
+                }
+            with _lock:
+                current = _browser_outbound_intent.get(auth_key)
+                if current is not None and current is record and current.get("state") == "authorized":
+                    current["remaining_actions"] = remaining - 1
+            return {"allowed": True, "state": "authorized", "remaining_actions": remaining - 1}
+
+        # Unknown/unrecognized state value -- fail closed, never guess.
+        return {
+            "allowed": False,
+            "state": "error",
+            "message": f"BLOCKED: browser outbound intent in unrecognized state {state!r} (fail closed).",
+        }
+    except Exception as exc:
+        logger.exception("check_browser_outbound_mutation_allowed: raised -- failing CLOSED")
+        return {
+            "allowed": False,
+            "state": "error",
+            "message": f"BLOCKED: browser outbound intent state check failed internally ({exc}).",
+        }
 
 
 def check_dangerous_command(command: str, env_type: str,
@@ -4812,6 +5638,19 @@ def check_all_command_guards(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
+    # Outbound-communication check runs here, BEFORE the "preserve existing
+    # non-interactive behavior" early-return below. That early-return exists
+    # for dangerous-command semantics (skip prompting when no human is
+    # present) and would otherwise short-circuit check_outbound_comm_guard()
+    # before it ever runs in a plain non-interactive/non-gateway/non-cron
+    # context — exactly the context its own fail_closed_when_no_human=True
+    # is designed to catch. Running it here ensures it always participates,
+    # with cron/gateway/no-human branching handled inside the gate itself
+    # (via _run_approval_gate), not by this function's outer early-return.
+    _outbound_decision = check_outbound_comm_guard("terminal", command)
+    if not _outbound_decision.get("approved", False):
+        return _outbound_decision
+
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
@@ -5082,7 +5921,10 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
-    # Nothing to warn about
+    # Nothing to warn about — the outbound-comm check already ran earlier
+    # in this function (before the non-interactive early-return), so a
+    # clean fallthrough here simply means no tirith/dangerous-command
+    # warnings AND outbound comm already cleared.
     if not warnings:
         return {"approved": True, "message": None}
 
@@ -5526,6 +6368,17 @@ def check_execute_code_guard(code: str, env_type: str,
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
+
+    # Outbound-communication content check: runs before the whole-script
+    # approval flow below so an email/SMS send buried in submitted source is
+    # gated on the recipient, not just on the script hash. Reuses the same
+    # cron/gateway/fail-closed machinery via _run_approval_gate internally
+    # (check_outbound_comm_guard -> _run_approval_gate), so cron_mode/gateway
+    # behavior for THIS check is consistent even though it runs ahead of this
+    # function's own cron branch below.
+    _outbound_decision = check_outbound_comm_guard("execute_code", code)
+    if not _outbound_decision.get("approved", False):
+        return _outbound_decision
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
