@@ -506,14 +506,7 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
                 + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
-        from tools.spill_safety import write_text_exclusive
-
-        # Deterministic filename in a well-known dir: refuse symlinks via
-        # lstat-unlink + exclusive create. Re-extraction of the same URL
-        # legitimately overwrites (same slug-digest name). Not private:
-        # cache/web is bind-mounted into remote backends whose container UID
-        # must be able to read it, and content is fetched public text.
-        write_text_exclusive(path, content, private=False, overwrite=True)
+        path.write_text(content, encoding="utf-8")
         return str(path)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to store full web_extract text for %s: %s", url, exc)
@@ -729,6 +722,62 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             response_data = provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+        
+        # ── Provenance Receipt Minting (Week 3) ──────────────────────────
+        # Mint cryptographic receipts for search results so they can be cited.
+        # The agent cannot call mint() - only this trusted tool code can.
+        session_id = None
+        try:
+            # Extract session_id from context (passed via registry.dispatch)
+            import inspect
+            frame = inspect.currentframe()
+            while frame:
+                # NOTE (2026-08-02, item #3 fix): same bug as file_tools.py
+                # read_file — must check truthiness, not just key presence.
+                # This function's own frame has a local named 'session_id'
+                # (None, assigned above), so a bare 'in frame.f_locals' check
+                # matched immediately at depth 0 and never walked up to find
+                # the real caller's session_id. Confirmed via live DB: 0
+                # web_search rows in provenance.db before this fix.
+                if 'session_id' in frame.f_locals and frame.f_locals['session_id']:
+                    session_id = frame.f_locals['session_id']
+                    break
+                frame = frame.f_back
+        except Exception:
+            pass
+        
+        if session_id and response_data.get("success"):
+            try:
+                from agent.provenance.gate import get_evidence_store
+                store = get_evidence_store()
+                if store:
+                    results = response_data.get("data", {}).get("web", [])
+                    _web_total = len(results)
+                    for idx, result in enumerate(results):
+                        try:
+                            token = store.mint(
+                                claim_id=f"web_search.{query[:50]}.result_{idx}",
+                                source_uri=result.get("url", "unknown"),
+                                content={
+                                    "title": result.get("title"),
+                                    "description": result.get("description"),
+                                    "url": result.get("url"),
+                                    "position": result.get("position", idx),
+                                },
+                                session_id=session_id,
+                                tool_name="web_search",
+                                ttl_seconds=3600,  # 1 hour - web data ages quickly
+                                result_count=_web_total,
+                                facts={"query": query, "total_count": _web_total},
+                            )
+                            # Inject token into result for citation
+                            result["_provenance_token"] = token.token_id
+                            result["_provenance_claim_id"] = token.claim_id
+                        except Exception as mint_err:
+                            logger.debug(f"Failed to mint receipt for result {idx}: {mint_err}")
+            except Exception as prov_err:
+                logger.debug(f"Provenance receipt minting failed (non-fatal): {prov_err}")
+        
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
         _debug.log_call("web_search_tool", debug_call_data)
