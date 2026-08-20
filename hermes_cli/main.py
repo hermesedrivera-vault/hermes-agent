@@ -4826,6 +4826,8 @@ _LAZY_COMMAND_EXPORTS = {
         "_capture_active_lazy_features",
         "_capture_active_tool_dependencies",
         "_capture_head_sha",
+        "_local_only_commits",
+        "_create_pre_reset_safety_tag",
         "_assess_parked_branch_switch",
         "_branch_head_label",
         "_branch_head_suffix",

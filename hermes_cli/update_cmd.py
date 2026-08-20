@@ -182,6 +182,102 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _local_only_commits(
+    git_cmd: list, cwd, branch_ref: str, remote_ref: str
+) -> tuple[list[str] | None, str]:
+    """List commits reachable from ``branch_ref`` but not from ``remote_ref``.
+
+    STEP 70 G.3: answers the narrow question a destructive
+    ``reset --hard <remote_ref>`` is about to act on — does ``remote_ref``
+    already contain ``branch_ref``'s tip ancestry? Per the authorized
+    scope, this does NOT search other branches/remotes for the same
+    commits; it only protects commits on the current branch from being
+    discarded by resetting it to ``remote_ref``.
+
+    Returns ``(commits, reason)``:
+      - ``commits`` is a list of one-line ``git log`` entries (oldest-safe
+        ordering not guaranteed; each entry uniquely identifies a
+        local-only commit for reporting purposes). An empty list means
+        verified: no local-only commits exist.
+      - ``commits is None`` means the check itself was unverifiable (git
+        command failed). Callers MUST treat ``None`` as fail-closed —
+        never as "zero commits" — and MUST NOT proceed with a destructive
+        reset. ``reason`` is ``""`` on success, and a short diagnostic
+        string when ``commits is None``.
+    """
+    try:
+        result = subprocess.run(
+            git_cmd + ["log", "--oneline", "--no-decorate",
+                       f"{remote_ref}..{branch_ref}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        return None, f"unverifiable: {exc}"
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        return None, f"unverifiable: git log exited {result.returncode}" + (
+            f" ({stderr})" if stderr else ""
+        )
+
+    commits = [line for line in result.stdout.splitlines() if line.strip()]
+    return commits, ""
+
+
+def _create_pre_reset_safety_tag(git_cmd: list, cwd, sha: str | None) -> str | None:
+    """Tag ``sha`` as a durable, discoverable pre-reset safety ref.
+
+    STEP 70 G.1: called immediately before every updater ``reset --hard``,
+    with ``sha`` set to the exact HEAD that exists at that moment (before
+    the reset moves it). Returns the created tag name on success, or
+    ``None`` on any failure (missing ``sha``, git error, OSError). Callers
+    MUST treat ``None`` as fail-closed and MUST NOT execute the reset.
+
+    Tag name format: ``hermes-update-pre-reset-<UTC timestamp>``, with
+    microsecond precision so back-to-back updater runs never collide.
+    """
+    if not sha:
+        return None
+
+    tag_name = "hermes-update-pre-reset-" + datetime.utcnow().strftime(
+        "%Y%m%dT%H%M%S.%fZ"
+    )
+    try:
+        result = subprocess.run(
+            git_cmd + ["tag", tag_name, sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    # Verify the tag actually points at the exact SHA we intended — belt
+    # and suspenders against a git version/quirk that reports success
+    # without creating the expected ref.
+    try:
+        verify_result = subprocess.run(
+            git_cmd + ["rev-parse", tag_name],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
+    if verify_result.returncode != 0:
+        return None
+    if verify_result.stdout.strip() != sha:
+        return None
+
+    return tag_name
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -5219,6 +5315,64 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
+                # STEP 70 G.3: before discarding anything, verify origin
+                # actually contains this branch's tip ancestry. A local-only
+                # commit here (e.g. a manual fix, or work never pushed) would
+                # otherwise be silently destroyed by the reset below — the
+                # exact failure class that wiped local security work in the
+                # past. Fail closed on ANY uncertainty: an unverifiable
+                # check is never treated as "no divergence".
+                local_only, local_only_reason = _m()._local_only_commits(
+                    git_cmd, _m().PROJECT_ROOT, branch, f"origin/{branch}"
+                )
+                if local_only is None:
+                    print(
+                        f"✗ Could not verify whether {branch} has local-only "
+                        f"commits ({local_only_reason})."
+                    )
+                    print(
+                        "  Refusing to reset --hard: an unverifiable divergence "
+                        "check is never treated as safe."
+                    )
+                    print(
+                        f"  Resolve manually, then retry: cd {_m().PROJECT_ROOT} && "
+                        f"git log origin/{branch}..{branch}"
+                    )
+                    sys.exit(1)
+                if local_only:
+                    print(
+                        f"✗ Refusing to reset --hard origin/{branch}: {branch} has "
+                        f"{len(local_only)} local-only commit(s) that would be "
+                        "discarded:"
+                    )
+                    for entry in local_only:
+                        print(f"    {entry}")
+                    print(
+                        "  Resolve manually (cherry-pick, rebase, or push these "
+                        "commits) before retrying ``hermes update``."
+                    )
+                    sys.exit(1)
+
+                # STEP 70 G.1: create a durable safety tag of the exact
+                # pre-reset HEAD before executing the destructive reset.
+                # Fail closed if the tag cannot be created or verified —
+                # the reset must never run without it.
+                pre_reset_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+                safety_tag = _m()._create_pre_reset_safety_tag(
+                    git_cmd, _m().PROJECT_ROOT, pre_reset_sha
+                )
+                if not safety_tag:
+                    print(
+                        "✗ Could not create a pre-reset safety tag "
+                        f"(pre-reset HEAD: {pre_reset_sha or 'unresolved'})."
+                    )
+                    print(
+                        "  Refusing to reset --hard: a destructive reset must "
+                        "never run without a recoverable safety tag."
+                    )
+                    sys.exit(1)
+                print(f"  → Safety tag created: {safety_tag}")
+
                 reset_result = subprocess.run(
                     git_cmd + ["reset", "--hard", f"origin/{branch}"],
                     cwd=_m().PROJECT_ROOT,
@@ -5255,6 +5409,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if pre_pull_sha:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
+                    # STEP 70 G.1: tag the current (bad) pre-rollback HEAD
+                    # as a durable safety ref before moving HEAD back to
+                    # pre_pull_sha, so the pulled-but-broken commit stays
+                    # discoverable rather than silently going unreachable.
+                    # Fail closed if the tag cannot be created/verified —
+                    # the rollback must never run without it.
+                    pre_rollback_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+                    safety_tag = _m()._create_pre_reset_safety_tag(
+                        git_cmd, _m().PROJECT_ROOT, pre_rollback_sha
+                    )
+                    if not safety_tag:
+                        print(
+                            "  ✗ Could not create a pre-rollback safety tag "
+                            f"(pre-rollback HEAD: {pre_rollback_sha or 'unresolved'})."
+                        )
+                        print(
+                            "  Refusing to roll back: a destructive reset must "
+                            "never run without a recoverable safety tag."
+                        )
+                        print(
+                            "  Recover manually with: "
+                            f"cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}"
+                        )
+                        sys.exit(1)
+                    print(f"  → Safety tag created: {safety_tag}")
+
                     rollback_result = subprocess.run(
                         git_cmd + ["reset", "--hard", pre_pull_sha],
                         cwd=_m().PROJECT_ROOT,
