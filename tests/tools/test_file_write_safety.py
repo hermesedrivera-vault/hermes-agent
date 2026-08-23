@@ -399,6 +399,13 @@ class TestProtectedInstructionFiles:
         monkeypatch.setattr(
             ft, "_protected_instruction_config", lambda: (True, [])
         )
+        # This class specifies ONLY the protected-instruction gate.
+        # The general file-write gate (Step 9 Phase 2) is a separate
+        # contract and is stubbed here so these tests do not deny
+        # ordinary paths via the CLI callback's default "deny".
+        monkeypatch.setattr(
+            ft, "_check_general_file_write", lambda *a, **k: None
+        )
         yield
 
     @pytest.fixture
@@ -643,6 +650,51 @@ class TestProtectedInstructionFiles:
                 A.unregister_gateway_notify(session_key)
         finally:
             A.reset_current_session_key(token)
+
+
+class TestGeneralFileWriteAuthorizationKey:
+    """Regression: param-binding must not AttributeError on the key getter.
+
+    Isolated from TestProtectedInstructionFiles. Does not disable the
+    production general-write gate; it only forces the binding branch on
+    and proves tools.approval exposes get_current_authorization_key.
+    """
+
+    def test_param_binding_path_does_not_raise_missing_authorization_key(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+        import tools.approval as A
+        import tools.file_tools as ft
+        from tools.file_tools import write_file_tool
+        from tools.terminal_tool import set_approval_callback
+
+        assert hasattr(A, "get_current_authorization_key")
+        monkeypatch.setattr(
+            ft, "_general_file_write_param_binding_enabled", lambda: True
+        )
+        monkeypatch.setattr(
+            ft, "_protected_instruction_config", lambda: (False, [])
+        )
+
+        def _deny(command, description, **kwargs):
+            return "deny"
+
+        set_approval_callback(_deny)
+        try:
+            target = tmp_path / "notes.md"
+            try:
+                res = json.loads(write_file_tool(str(target), "x"))
+            except AttributeError as exc:
+                raise AssertionError(
+                    "param-binding path raised AttributeError "
+                    f"(missing get_current_authorization_key?): {exc}"
+                ) from exc
+            assert res.get("error"), res
+            assert "BLOCKED" in res["error"]
+            assert not target.exists()
+        finally:
+            set_approval_callback(None)
 
 
 if __name__ == "__main__":

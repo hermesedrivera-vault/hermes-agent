@@ -62,6 +62,19 @@ _approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_id",
     default="",
 )
+# Phase 3 (Step 9) task/subagent scope. Restored 2026-08-22 after
+# ce5760f19b dropped the symbols while file_tools.py (7a1294e892) still
+# calls get_current_authorization_key() whenever
+# approvals.general_file_write_param_binding_enabled is true.
+# Empty task_id collapses the composite key to the plain session key.
+_approval_task_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_task_id",
+    default="",
+)
+_approval_subagent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_subagent_id",
+    default="",
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -237,6 +250,41 @@ def get_current_session_key(default: str = "default") -> str:
         return session_key
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
+
+
+def get_current_authorization_key(default: str = "default") -> str:
+    """Return session::task::subagent composite key used by scoped gates.
+
+    When no task_id is bound, this is identical to get_current_session_key().
+    Restored 2026-08-22 — file_tools general-write gate calls this when
+    approvals.general_file_write_param_binding_enabled is true.
+    """
+    session_key = get_current_session_key(default=default)
+    task_id = _approval_task_id.get()
+    if not task_id:
+        return session_key
+    subagent_id = _approval_subagent_id.get()
+    return f"{session_key}::task={task_id}::sub={subagent_id}"
+
+
+def set_current_authorization_scope(
+    task_id: str = "",
+    subagent_id: str = "",
+) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
+    """Bind task/subagent ids for the current approval context."""
+    return (
+        _approval_task_id.set(task_id or ""),
+        _approval_subagent_id.set(subagent_id or ""),
+    )
+
+
+def reset_current_authorization_scope(
+    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
+) -> None:
+    """Restore prior task/subagent authorization scope."""
+    task_token, subagent_token = tokens
+    _approval_subagent_id.reset(subagent_token)
+    _approval_task_id.reset(task_token)
 
 
 def _get_session_platform() -> str:
