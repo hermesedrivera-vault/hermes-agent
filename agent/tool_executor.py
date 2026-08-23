@@ -686,11 +686,37 @@ def _run_agent_tool_execution_middleware(
             name=f"tool-activity-hb-{function_name[:24]}",
         )
         _hb_thread.start()
+        from tools import approval as _approval
+
+        # STEP 70/Phase-3 authorization scope wiring: bind the composite
+        # session::task=<task>::sub=<subagent> identity for the duration of
+        # this tool's actual execution, so tools.file_tools's general-write
+        # approval gate (approvals.general_file_write_param_binding_enabled)
+        # can key approvals per task/subagent instead of always collapsing
+        # to the bare session key. set_current_authorization_scope() is a
+        # plain ContextVar.set() and is not expected to raise; if it does,
+        # let it propagate rather than dispatching the tool with an
+        # ambiguous/unbound authorization identity (fail closed).
+        _authz_tokens = _approval.set_current_authorization_scope(
+            effective_task_id, getattr(agent, "_subagent_id", "") or ""
+        )
         try:
-            return execute(final_args)
+            try:
+                return execute(final_args)
+            finally:
+                _hb_stop.set()
+                _hb_thread.join(timeout=2.0)
         finally:
-            _hb_stop.set()
-            _hb_thread.join(timeout=2.0)
+            try:
+                _approval.reset_current_authorization_scope(_authz_tokens)
+            except Exception:
+                logger.error(
+                    "Failed to reset authorization scope after tool "
+                    "execution (function=%s, task_id=%s)",
+                    function_name,
+                    effective_task_id,
+                    exc_info=True,
+                )
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
