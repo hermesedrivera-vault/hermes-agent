@@ -416,6 +416,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/devops/devops-hermes-s6-container-supervision',
                     'user-guide/skills/optional/devops/devops-inference-sh-cli',
                     'user-guide/skills/optional/devops/devops-pinggy-tunnel',
+                    'user-guide/skills/optional/devops/devops-setup-wizard-generator',
                     'user-guide/skills/optional/devops/devops-watchers',
                   ],
                 },
@@ -551,6 +552,7 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/optional/productivity/productivity-canvas',
+                    'user-guide/skills/optional/productivity/productivity-decision-questionnaire',
                     'user-guide/skills/optional/productivity/productivity-here-now',
                     'user-guide/skills/optional/productivity/productivity-memento-flashcards',
                     'user-guide/skills/optional/productivity/productivity-shop',
@@ -600,6 +602,7 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/optional/software-development/software-development-code-wiki',
+                    'user-guide/skills/optional/software-development/software-development-plan-interrogation',
                     'user-guide/skills/optional/software-development/software-development-rest-graphql-debug',
                     'user-guide/skills/optional/software-development/software-development-subagent-driven-development',
                   ],
@@ -612,6 +615,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy',
                     'user-guide/skills/optional/web-development/web-development-page-agent',
+                    'user-guide/skills/optional/web-development/web-development-publish-site',
                   ],
                 },
                 {
@@ -723,6 +727,7 @@ const sidebars: SidebarsConfig = {
         'guides/team-telegram-assistant',
         'guides/python-library',
         'guides/use-mcp-with-hermes',
+        'guides/manage-hermes-cloud-with-mcp',
         'guides/use-soul-with-hermes',
         'guides/use-voice-mode-with-hermes',
         'guides/automate-with-cron',
@@ -789,6 +794,7 @@ const sidebars: SidebarsConfig = {
                 'developer-guide/video-gen-provider-plugin',
                 'developer-guide/web-search-provider-plugin',
                 'developer-guide/browser-provider-plugin',
+                'developer-guide/terminal-environment-plugin',
               ],
             },
             'developer-guide/creating-skills',
