@@ -1073,10 +1073,21 @@ def _request_general_file_write_approval(paths: list[str],
                                   "subsystem is unavailable.")
 
     # Step 16 (Finding A+B fix): when the flag is enabled, bind the
-    # approval identity to the resolved path set + operation type, and
-    # look it up via the Phase-3 composed session::task::sub key instead
-    # of the bare session key. When disabled (default), preserve the
-    # exact prior (unbound) behavior byte-for-byte for a safe rollout.
+    # approval-tracking identity (session/permanent allowlist persistence)
+    # to the resolved path set + operation type via the Phase-3 composed
+    # session::task::sub key. When disabled (default), preserve the exact
+    # prior (unbound) behavior byte-for-byte for a safe rollout.
+    #
+    # Gateway notify-callback routing is DIFFERENT and always session-scoped
+    # (see Aug 24 diagnostic finding): `register_gateway_notify` in
+    # gateway/run.py only ever registers the bare session key returned by
+    # `get_current_session_key()` — there is no task/subagent-scoped
+    # registration path. Looking the callback up under the composite key
+    # from `get_current_authorization_key()` is therefore a guaranteed
+    # dict-miss whenever a task/subagent scope is bound, independent of
+    # whether a live callback exists. `notify_session_key` is kept separate
+    # from the approval-tracking `session_key` so the persistence grain
+    # (Step 16's intent) is unaffected by this fix.
     if _general_file_write_param_binding_enabled():
         pattern_key = _general_file_write_pattern_key(
             paths, task_id, operation_type)
@@ -1084,6 +1095,7 @@ def _request_general_file_write_approval(paths: list[str],
     else:
         pattern_key = "general_file_write"
         session_key = _approval.get_current_session_key()
+    notify_session_key = _approval.get_current_session_key()
 
     # Session-scoped approval already granted this session — skip re-prompt.
     try:
@@ -1102,12 +1114,19 @@ def _request_general_file_write_approval(paths: list[str],
 
     # Gateway surface: block on the button round-trip when a notify
     # callback is registered for this session (Telegram/Discord/Slack).
+    # Notify routing is session-scoped (see note above) — always look up
+    # under the bare session key, never the composite task/subagent key.
     notify_cb = None
     try:
         with _approval._lock:
-            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+            notify_cb = _approval._gateway_notify_cbs.get(notify_session_key)
     except Exception:
         notify_cb = None
+    logger.debug(
+        "DIAG _gateway_notify_cbs lookup session_key=%r hit=%s registered_keys=%r",
+        notify_session_key, notify_cb is not None,
+        list(getattr(_approval, "_gateway_notify_cbs", {}).keys()),
+    )
 
     if notify_cb is not None:
         approval_data = {
@@ -1119,7 +1138,7 @@ def _request_general_file_write_approval(paths: list[str],
             "allow_session": True,
         }
         decision = _approval._await_gateway_decision(
-            session_key, notify_cb, approval_data, surface="gateway",
+            notify_session_key, notify_cb, approval_data, surface="gateway",
         )
         if decision.get("notify_failed"):
             return blocked.format(
@@ -2488,6 +2507,48 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
+    """Reject text-tool writes that would corrupt a binary document.
+
+    ``read_file`` auto-extracts .docx/.xlsx/.pptx (and PDF, via anydoc) to
+    readable text, so the model plausibly believes it holds the file's
+    contents and tries to write the edited text back with write_file/patch.
+    Opaque container formats (OOXML/OLE/ODF/EPUB/RTF) are ZIP/binary
+    containers, not plain text — a text-tool write can never produce a
+    valid container and always destroys the file, so those are rejected
+    unconditionally. PDF is different: raw PDF syntax is text-authorable,
+    so creating a brand-new .pdf via write_file is legitimate; only an
+    OVERWRITE of an existing .pdf is dangerous (the model almost certainly
+    holds extracted text, not real PDF syntax, in that case).
+
+    Restored 2026-08-29 after being silently dropped by commit 7a1294e892
+    ("restore provenance gate") on 2026-08-20, which replaced this file's
+    write-approval section without carrying this guard or its two call
+    sites forward. See tests/tools/test_binary_document_write_guard.py
+    for the regression coverage that would have caught the removal.
+    """
+    from tools.binary_extensions import has_opaque_document_extension, is_pdf_path
+
+    if has_opaque_document_extension(filepath):
+        ext = Path(filepath).suffix.lower()
+        return (
+            f"BLOCKED: Refusing to write plain text to binary document '{filepath}' ({ext}). "
+            "Writing text directly to this path would corrupt the file (read_file showed you "
+            "EXTRACTED text, not the real bytes). Use the docx/xlsx/powerpoint skills or a "
+            "library like python-docx/openpyxl/python-pptx via the terminal to create or edit "
+            "this file instead."
+        )
+    if is_pdf_path(filepath) and Path(filepath).exists():
+        return (
+            f"BLOCKED: Refusing to overwrite existing PDF '{filepath}' with a text-tool write. "
+            "read_file shows extracted text, not real PDF syntax — writing it back would "
+            "corrupt the file. Use the pdf skill or a library like pypdf/reportlab via the "
+            "terminal to edit this document instead. Creating a brand-new .pdf (path does "
+            "not yet exist) is still allowed."
+        )
+    return None
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2501,6 +2562,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    binary_doc_err = _check_binary_document_write(path, task_id)
+    if binary_doc_err:
+        return tool_error(binary_doc_err)
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
         return tool_error(protected_err)
@@ -2608,8 +2672,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
+    _write_target_paths = []
     if path:
         _paths_to_check.append(path)
+        _write_target_paths.append(path)
     if mode == "patch" and patch:
         import re as _re
         from tools.path_security import has_traversal_component
@@ -2635,16 +2701,23 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # it accepts ``***Update File:`` with no space after the asterisks
         # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
         # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        for _m in _re.finditer(r'^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+            _v4a_op = _m.group(1)
+            v4a_path = _m.group(2).strip()
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
+            # Delete doesn't write text content — exempt it from the
+            # binary-document guard below (Update/Add do write content).
+            if _v4a_op != "Delete":
+                _write_target_paths.append(v4a_path)
         # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
         # but was never extracted, so a Move targeting /etc/crontab skipped the
         # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
+        # the same ``..`` traversal rejection as the other headers. Move alone
+        # doesn't rewrite text content either, so it's excluded from
+        # _write_target_paths same as Delete.
         for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
             for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
                 _err = _reject_v4a_traversal(v4a_path)
@@ -2659,6 +2732,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    for _p in _write_target_paths:
+        binary_doc_err = _check_binary_document_write(_p, task_id)
+        if binary_doc_err:
+            return tool_error(binary_doc_err)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
