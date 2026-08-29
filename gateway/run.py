@@ -6567,6 +6567,10 @@ class TurnRunner:
 
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
+        logger.debug(
+            "DIAG register_gateway_notify session_key=%r at %s",
+            _approval_session_key, time.time(),
+        )
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
