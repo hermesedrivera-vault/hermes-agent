@@ -647,6 +647,109 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
     return _latest_release_cache
 
 
+# Cache the fork-vs-upstream lag check for a day — this is informational,
+# not time-critical, and avoids a network `ls-remote` on every session start.
+_FORK_BEHIND_CACHE_SECONDS = 24 * 3600
+
+
+def _fork_behind_upstream_count() -> Optional[int]:
+    """How many commits origin/main lags upstream/main, cached for a day.
+
+    Reuses ``_upstream_main_sha()`` (HTTPS ls-remote, no auth/SSH prompts)
+    rather than adding new remote-comparison logic. Returns ``None`` on any
+    failure (no checkout, no origin/main, network error) so the caller can
+    omit the banner line entirely instead of erroring or blocking startup —
+    same fail-silent contract as ``check_for_updates()``.
+
+    Cache key includes the local origin/main SHA: if this fork's own main
+    moves (e.g. after `hermes update` or a manual merge), the cached
+    "behind" count is invalidated immediately rather than waiting out the
+    TTL, so a stale count is never shown right after a sync.
+    """
+    repo_dir = _resolve_repo_dir()
+    if repo_dir is None:
+        return None
+
+    origin_rev = _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+    if not origin_rev:
+        return None
+
+    hermes_home = get_hermes_home()
+    cache_file = hermes_home / ".fork_behind_upstream_check"
+    now = time.time()
+    try:
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (
+                now - cached.get("ts", 0) < _FORK_BEHIND_CACHE_SECONDS
+                and cached.get("origin_rev") == origin_rev
+            ):
+                return cached.get("behind")
+    except Exception:
+        pass
+
+    upstream_rev = _upstream_main_sha()
+    if not upstream_rev:
+        # Network failure or upstream unreachable — fail silently, do not
+        # write a cache entry (so the next session start retries rather
+        # than caching a transient outage for a full day).
+        return None
+
+    if upstream_rev == origin_rev:
+        behind = 0
+    else:
+        # ls-remote gives tip SHAs only — no local fetch happens, so a
+        # local `git rev-list` can't count the gap (the upstream commit
+        # object isn't in this checkout's store). Same constraint
+        # check_for_updates() hits; reuse its solution: the GitHub
+        # compare API knows the full graph regardless of local depth.
+        counted = _github_compare_behind(origin_rev, upstream_rev)
+        behind = counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
+
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(
+            json.dumps({"ts": now, "origin_rev": origin_rev, "behind": behind}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # Cache write failure never blocks reporting the result.
+
+    return behind
+
+
+def _format_fork_behind_line(behind: Optional[int]) -> Optional[str]:
+    """Render the fork-behind-upstream banner line for a given count.
+
+    Returns ``None`` (omit the line) when ``behind`` is falsy — the fork
+    is current, or the check hasn't produced a usable result.
+    """
+    if not behind:
+        return None
+    word = "commit" if behind == 1 else "commits"
+    if behind == UPDATE_AVAILABLE_NO_COUNT:
+        return "⚠ Fork is behind upstream (NousResearch/hermes-agent)"
+    return f"⚠ Fork is {behind} {word} behind upstream (NousResearch/hermes-agent)"
+
+
+def format_fork_behind_upstream_line() -> Optional[str]:
+    """Second banner line: how far this fork's origin/main lags the
+    official NousResearch/hermes-agent upstream. Returns ``None`` (omit
+    the line) when the check can't run or the fork is current — never
+    raises, never blocks longer than the cached/ls-remote path allows.
+
+    Runs the check synchronously (uncached path may do a real
+    ``ls-remote``) — prefer ``get_fork_behind_result()`` + this module's
+    ``_format_fork_behind_line()`` helper in the banner render path so a
+    cold cache never blocks startup.
+    """
+    try:
+        behind = _fork_behind_upstream_count()
+    except Exception:
+        return None
+    return _format_fork_behind_line(behind)
+
+
 def format_banner_version_label() -> str:
     """Return the version label shown in the startup banner title."""
     base = f"Hermes Agent v{VERSION} ({RELEASE_DATE})"
@@ -715,14 +818,44 @@ def prefetch_banner_data():
             get_available_skills()
         except Exception:
             pass
-
     threading.Thread(target=_run, name="banner-data-prefetch", daemon=True).start()
+    prefetch_fork_behind_check()
 
 
 def get_update_result(timeout: float = 0.5) -> Optional[int]:
     """Get result of prefetched check. Returns None if not ready."""
     _update_check_done.wait(timeout=timeout)
     return _update_result
+
+
+_fork_behind_result: Optional[int] = None
+_fork_behind_check_done = threading.Event()
+
+
+def prefetch_fork_behind_check():
+    """Kick off the fork-vs-upstream lag check in a background daemon
+    thread, same non-blocking shape as ``prefetch_update_check()``. The
+    underlying check is cached for a day (``_FORK_BEHIND_CACHE_SECONDS``),
+    so most calls resolve from disk with no network round-trip at all.
+    """
+    def _run():
+        global _fork_behind_result
+        try:
+            _fork_behind_result = _fork_behind_upstream_count()
+        except Exception:
+            _fork_behind_result = None
+        _fork_behind_check_done.set()
+    t = threading.Thread(target=_run, name="fork-behind-prefetch", daemon=True)
+    t.start()
+
+
+def get_fork_behind_result(timeout: float = 0.05) -> Optional[int]:
+    """Get the prefetched fork-behind-upstream result. Never blocks longer
+    than ``timeout`` — same non-blocking contract as ``get_update_result``.
+    Returns ``None`` if not ready yet or the check failed/found no lag.
+    """
+    _fork_behind_check_done.wait(timeout=timeout)
+    return _fork_behind_result
 
 
 def _format_update_notice(behind: int) -> str:
@@ -1273,6 +1406,18 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             right_lines.append(_format_update_notice(behind))
     except Exception:
         pass  # Never break the banner over an update check
+
+    # Fork-vs-upstream lag — informational only, daily-cached, never
+    # blocks: if the prefetch (started in prefetch_banner_data) hasn't
+    # resolved within the peek window, just omit the line this session
+    # rather than deferring a print for something this low-priority.
+    try:
+        fork_behind = get_fork_behind_result(timeout=0.05)
+        fork_line = _format_fork_behind_line(fork_behind)
+        if fork_line:
+            right_lines.append(f"[dim yellow]{fork_line}[/]")
+    except Exception:
+        pass  # Never break the banner over the fork-lag check
 
     right_content = "\n".join(right_lines)
     layout_table.add_row(left_content, right_content)
