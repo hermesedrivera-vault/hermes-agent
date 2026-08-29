@@ -258,13 +258,21 @@ def get_current_authorization_key(default: str = "default") -> str:
     When no task_id is bound, this is identical to get_current_session_key().
     Restored 2026-08-22 — file_tools general-write gate calls this when
     approvals.general_file_write_param_binding_enabled is true.
+
+    Fixed 2026-08-24: subagent_id defaults to "" (falsy) when only a task
+    scope is bound. The prior unconditional f"...::sub={subagent_id}"
+    always appended a literal "::sub=" suffix in that case, producing a
+    key no registration path ever writes under. Only append the ::sub=
+    segment when subagent_id is actually truthy.
     """
     session_key = get_current_session_key(default=default)
     task_id = _approval_task_id.get()
     if not task_id:
         return session_key
     subagent_id = _approval_subagent_id.get()
-    return f"{session_key}::task={task_id}::sub={subagent_id}"
+    if subagent_id:
+        return f"{session_key}::task={task_id}::sub={subagent_id}"
+    return f"{session_key}::task={task_id}"
 
 
 def set_current_authorization_scope(
