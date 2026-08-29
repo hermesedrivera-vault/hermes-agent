@@ -86,6 +86,7 @@ hermes skills uninstall <skill-name>
 | [**hermes-s6-container-supervision**](/docs/user-guide/skills/optional/devops/devops-hermes-s6-container-supervision) | Modify or debug s6 services in the Hermes Docker image. |
 | [**inference-sh-cli**](/docs/user-guide/skills/optional/devops/devops-inference-sh-cli) | Run 150+ AI apps (image, video, LLM) via inference.sh CLI. |
 | [**pinggy-tunnel**](/docs/user-guide/skills/optional/devops/devops-pinggy-tunnel) | Zero-install localhost tunnels over SSH via Pinggy. |
+| [**setup-wizard-generator**](/docs/user-guide/skills/optional/devops/devops-setup-wizard-generator) | Generate a bash wizard guiding a human through manual setup. |
 | [**watchers**](/docs/user-guide/skills/optional/devops/devops-watchers) | Poll RSS, JSON APIs, and GitHub with watermark dedup. |
 
 ## dogfood
@@ -98,7 +99,7 @@ hermes skills uninstall <skill-name>
 
 | Skill | Description |
 |-------|-------------|
-| [**agentmail**](/docs/user-guide/skills/optional/email/email-agentmail) | Give the agent its own inbox: send and receive email. |
+| [**agentmail**](/docs/user-guide/skills/optional/email/email-agentmail) | Use when an agent needs AgentMail CLI email inboxes. |
 
 ## finance
 
@@ -191,6 +192,7 @@ hermes skills uninstall <skill-name>
 | Skill | Description |
 |-------|-------------|
 | [**canvas**](/docs/user-guide/skills/optional/productivity/productivity-canvas) | Fetch Canvas LMS courses and assignments via API token. |
+| [**decision-questionnaire**](/docs/user-guide/skills/optional/productivity/productivity-decision-questionnaire) | Turn an unanswerable decision into a questionnaire doc. |
 | [**here-now**](/docs/user-guide/skills/optional/productivity/productivity-here-now) | Publish sites to &#123;slug&#125;.here.now and store files in Drives. |
 | [**memento-flashcards**](/docs/user-guide/skills/optional/productivity/productivity-memento-flashcards) | Spaced-repetition flashcards: create, review, quiz, export. |
 | [**shop**](/docs/user-guide/skills/optional/productivity/productivity-shop) | Shop catalog search, checkout, order tracking, returns. |
@@ -231,6 +233,7 @@ hermes skills uninstall <skill-name>
 | Skill | Description |
 |-------|-------------|
 | [**code-wiki**](/docs/user-guide/skills/optional/software-development/software-development-code-wiki) | Generate wiki docs + Mermaid diagrams for any codebase. |
+| [**plan-interrogation**](/docs/user-guide/skills/optional/software-development/software-development-plan-interrogation) | Adversarial plan interview before implementation. |
 | [**rest-graphql-debug**](/docs/user-guide/skills/optional/software-development/software-development-rest-graphql-debug) | Debug REST/GraphQL APIs: status codes, auth, schemas, repro. |
 | [**subagent-driven-development**](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development) | Execute plans via delegate_task subagents (2-stage review). |
 
@@ -240,6 +243,7 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**cloudflare-temporary-deploy**](/docs/user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy) | Deploy a Worker live, no account, via wrangler --temporary. |
 | [**page-agent**](/docs/user-guide/skills/optional/web-development/web-development-page-agent) | Embed an in-page natural-language GUI copilot in web apps. |
+| [**publish-site**](/docs/user-guide/skills/optional/web-development/web-development-publish-site) | Versioned site deploys to GitHub/Cloudflare/Netlify Pages. |
 
 ## yuanbao
 
