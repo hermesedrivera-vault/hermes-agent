@@ -299,9 +299,12 @@ class TestSingleQueryExecuteCode:
             result = approval_module.check_execute_code_guard("import os", "local")
             assert result["approved"]
 
-    def test_headless_execute_code_still_auto_approves_outside_single_query(self, monkeypatch):
-        """Without the single-query marker, headless execute_code keeps its
-        documented auto-approve contract (no behavior change outside -q)."""
+    def test_headless_execute_code_now_fails_closed_outside_single_query(self, monkeypatch):
+        """Previously asserted the OLD 'documented auto-approve contract' as
+        correct outside -q — that contract was the exact security gap
+        closed by the 2026-08-29 approval-fallback exposure audit (Phase 4
+        priority item). Headless execute_code with no CLI/gateway/cron/
+        single-query context now fails closed by default."""
         monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -309,7 +312,7 @@ class TestSingleQueryExecuteCode:
         monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
         result = approval_module.check_execute_code_guard("import os", "local")
-        assert result["approved"]
+        assert result["approved"] is False
 
 
 # ---------------------------------------------------------------------------

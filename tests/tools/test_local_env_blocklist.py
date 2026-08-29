@@ -749,6 +749,8 @@ class TestPythonpathSelectiveStrip:
                    side_effect=_mock_handle_function_call), \
              patch("tools.code_execution_tool._uses_hermes_python_environment",
                    return_value=same_env), \
+             patch("tools.approval.check_execute_code_guard",
+                   return_value={"approved": True, "message": None}), \
              patch("subprocess.Popen", side_effect=_fake_popen), \
              patch.dict(os.environ, {
                  "PYTHONPATH": os.pathsep.join(

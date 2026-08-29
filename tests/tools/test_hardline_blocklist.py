@@ -732,20 +732,34 @@ def test_recoverable_dangerous_commands_still_pass_yolo(clean_session, monkeypat
     """Yolo still bypasses the regular DANGEROUS_PATTERNS list.
 
     This confirms we haven't broken the yolo escape hatch — only narrowed it.
-    """
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
 
-    # These are dangerous but NOT hardline — yolo should still pass them.
-    for cmd in ["rm -rf /tmp/x", "chmod -R 777 .", "git reset --hard", "git push --force"]:
-        # Sanity: still flagged as dangerous
-        is_dangerous, _, _ = detect_dangerous_command(cmd)
-        assert is_dangerous, f"precondition: {cmd!r} should be in DANGEROUS_PATTERNS"
-        # But NOT hardline
-        is_hl, _ = detect_hardline_command(cmd)
-        assert not is_hl, f"{cmd!r} should not be hardline"
-        # And yolo bypasses the dangerous check
-        result = check_dangerous_command(cmd, "local")
-        assert result["approved"] is True, f"yolo should have bypassed {cmd!r}"
+    Corrected 2026-08-29 (approval-fallback exposure audit): this test never
+    actually engaged yolo. ``HERMES_YOLO_MODE`` is read into
+    ``_YOLO_MODE_FROZEN`` once at module import time — a
+    ``monkeypatch.setenv`` mid-test cannot retroactively change it — so on
+    both the old and new code this test's `clean_session` fixture leaves
+    ``_YOLO_MODE_FROZEN`` and ``is_current_session_yolo_enabled()`` both
+    False. The assertion passed on old code only because the (now-removed)
+    unconditional fail-open fallback at the bottom of ``_run_approval_gate``
+    approved everything unattended regardless of yolo. Now that fallback
+    fails closed by default, so this test must genuinely enable
+    session-scoped yolo to exercise what it claims to test.
+    """
+    enable_session_yolo("hardline_test")
+    try:
+        # These are dangerous but NOT hardline — yolo should still pass them.
+        for cmd in ["rm -rf /tmp/x", "chmod -R 777 .", "git reset --hard", "git push --force"]:
+            # Sanity: still flagged as dangerous
+            is_dangerous, _, _ = detect_dangerous_command(cmd)
+            assert is_dangerous, f"precondition: {cmd!r} should be in DANGEROUS_PATTERNS"
+            # But NOT hardline
+            is_hl, _ = detect_hardline_command(cmd)
+            assert not is_hl, f"{cmd!r} should not be hardline"
+            # And yolo bypasses the dangerous check
+            result = check_dangerous_command(cmd, "local")
+            assert result["approved"] is True, f"yolo should have bypassed {cmd!r}"
+    finally:
+        disable_session_yolo("hardline_test")
 
 
 def test_hardline_list_is_small():

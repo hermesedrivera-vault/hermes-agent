@@ -127,7 +127,14 @@ class TestCronContextVarDetection:
         assert code["approved"] is False
         assert code["outcome"] == "blocked"
 
-    def test_non_cron_blank_context_keeps_headless_execute_code_legacy_approved(self, monkeypatch):
+    def test_non_cron_blank_context_headless_execute_code_now_fails_closed(self, monkeypatch):
+        """Previously asserted the OLD fail-open behavior ("legacy
+        approved") as correct — that was the confirmed security gap closed
+        by the 2026-08-29 approval-fallback exposure audit (Phase 4
+        priority item). A blank cron-session-var context with no other
+        approval surface reachable now blocks by default; explicit opt-in
+        via approvals.execute_code_noninteractive_mode: approve restores
+        the old behavior for a specific known workflow."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -142,7 +149,7 @@ class TestCronContextVarDetection:
         finally:
             clear_session_vars(tokens)
 
-        assert result["approved"] is True
+        assert result["approved"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -411,15 +418,22 @@ class TestCronModeInteractions:
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
             assert result["approved"]
 
-    def test_non_cron_non_interactive_still_auto_approves(self, monkeypatch):
-        """Non-cron, non-interactive sessions (e.g. scripted usage) still auto-approve."""
+    def test_non_cron_non_interactive_now_fails_closed(self, monkeypatch):
+        """Non-cron, non-interactive sessions (e.g. scripted usage) with no
+        known context now BLOCK by default (fail-closed) rather than
+        silently auto-approving — see the 2026-08-29 approval-fallback
+        exposure audit. This test previously asserted the OLD fail-open
+        behavior as correct; that behavior was the confirmed security gap
+        this fix closes. Explicit config opt-in restores the old behavior
+        for a specific known non-interactive workflow (tested separately
+        in test_noninteractive_failclosed_20260829.py)."""
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
         result = check_dangerous_command("rm -rf /tmp/stuff", "local")
-        assert result["approved"]
+        assert result["approved"] is False
 
 
 class TestCronWithGatewayOrigin:

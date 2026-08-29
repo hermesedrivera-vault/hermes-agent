@@ -3567,6 +3567,36 @@ def _get_single_query_approval_mode() -> str:
         return "deny"
 
 
+def _get_noninteractive_dangerous_command_mode() -> str:
+    """Read the non-cron/non-single-query/non-interactive/non-gateway
+    dangerous-command mode from config. Returns 'block' or 'approve'.
+
+    This is the final fallback branch reached when a dangerous shell command
+    is flagged and NONE of the known contexts apply (not CLI, not gateway,
+    not cron, not single-query -q). Historically this branch auto-approved
+    with a log warning ("fail-open") — a script that can't get a human ran
+    anyway. Default is now 'block' (fail-closed): a script that can't get a
+    human should fail loudly and wait, not proceed. Set
+    ``approvals.dangerous_command_noninteractive_mode: approve`` in
+    config.yaml to restore the historical auto-approve behavior for a
+    specific known, explicitly-authorized non-interactive workflow.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+        mode = str(
+            cfg_get(
+                config, "approvals", "dangerous_command_noninteractive_mode",
+                default="block",
+            )
+        ).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "block"
+    except Exception:
+        return "block"
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -3854,7 +3884,16 @@ def _run_approval_gate(
                     "pattern_key": pattern_key,
                     "description": description,
                 }
-            # cron_mode: approve — fall through to auto-approve below.
+            # cron_mode: approve — auto-approve. Must return here rather than
+            # fall through: the new non-interactive fail-closed default
+            # below would otherwise block the very action cron_mode: approve
+            # just authorized.
+            logger.warning(
+                "%s (pattern: %s): %s — cron auto-approve "
+                "(approvals.cron_mode: approve).",
+                autoapprove_log_prefix, pattern_key, description,
+            )
+            return {"approved": True, "message": None}
         elif fail_closed_when_no_human:
             # Non-cron, non-interactive, no gateway: no human can answer.
             # The plugin-escalation path opts in to fail-closed here so a
@@ -3876,11 +3915,29 @@ def _run_approval_gate(
                 "description": description,
             }
         logger.warning(
-            "%s (pattern: %s): %s — set HERMES_INTERACTIVE or "
-            "HERMES_GATEWAY_SESSION to require approval.",
+            "%s (pattern: %s): %s — no interactive user/gateway/cron/single-"
+            "query context present; BLOCKED (fail-closed). Set "
+            "approvals.dangerous_command_noninteractive_mode: approve in "
+            "config.yaml to restore auto-approve for this specific known "
+            "non-interactive workflow.",
             autoapprove_log_prefix, pattern_key, description,
         )
-        return {"approved": True, "message": None}
+        if _get_noninteractive_dangerous_command_mode() == "approve":
+            return {"approved": True, "message": None}
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Command flagged as dangerous ({description}) but no "
+                "interactive user, gateway, cron, or single-query context is "
+                "present to approve it. A script that can't get a human fails "
+                "closed rather than proceeding. To allow this specific known "
+                "non-interactive workflow, set "
+                "approvals.dangerous_command_noninteractive_mode: approve in "
+                "config.yaml."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
 
     if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
         # Interactive gateway round-trip when a notify callback is
@@ -4840,7 +4897,16 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
-            # single_query_mode: approve — fall through to auto-approve below.
+            else:
+                # single_query_mode: approve — auto-approve. Must return
+                # here rather than fall through: the non-interactive
+                # fail-closed default below would otherwise block the very
+                # action single_query_mode: approve just authorized.
+                logger.warning(
+                    "AUTO-APPROVED dangerous command in single-query "
+                    "session (approvals.single_query_mode: approve).",
+                )
+                return {"approved": True, "message": None}
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -4904,6 +4970,46 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
+            return {"approved": True, "message": None}
+
+        # Neither CLI, gateway, ask, single-query, nor cron: no known
+        # non-interactive context claims this session. Historically this
+        # fell through to an unconditional, UNLOGGED auto-approve ("we do
+        # not block on approvals... outside CLI/gateway/ask flows" — no
+        # warning, no config gate, silent). That is the exact fail-open gap
+        # this fix closes: default is now 'block' (fail-closed) — a session
+        # that can't get a human should fail loudly and wait, not proceed
+        # silently. Set approvals.dangerous_command_noninteractive_mode:
+        # approve in config.yaml to restore the historical behavior for a
+        # specific known, explicitly-authorized non-interactive workflow.
+        is_dangerous, _pk, description = detect_dangerous_command(command)
+        if is_dangerous:
+            logger.warning(
+                "AUTO-APPROVED dangerous command in non-interactive "
+                "non-gateway context (pattern: %s): %s — no interactive "
+                "user/gateway/cron/single-query context present; BLOCKED "
+                "(fail-closed). Set "
+                "approvals.dangerous_command_noninteractive_mode: approve "
+                "in config.yaml to restore auto-approve for this specific "
+                "known non-interactive workflow.",
+                _pk, description,
+            )
+            if _get_noninteractive_dangerous_command_mode() == "approve":
+                return {"approved": True, "message": None}
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: Command flagged as dangerous ({description}) but "
+                    "no interactive user, gateway, cron, or single-query "
+                    "context is present to approve it. A script/session that "
+                    "can't get a human fails closed rather than proceeding. "
+                    "To allow this specific known non-interactive workflow, "
+                    "set approvals.dangerous_command_noninteractive_mode: "
+                    "approve in config.yaml."
+                ),
+                "pattern_key": _pk,
+                "description": description,
+            }
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -5347,6 +5453,36 @@ def check_all_command_guards(command: str, env_type: str,
             "user_approved": True, "description": combined_desc}
 
 
+def _get_execute_code_noninteractive_mode() -> str:
+    """Read the execute_code-specific non-interactive fallback mode from
+    config. Returns 'block' or 'approve'.
+
+    Deliberately a SEPARATE config key from
+    ``approvals.dangerous_command_noninteractive_mode`` (the shell-command
+    opt-in). execute_code runs arbitrary local Python — subprocess, os.system,
+    ctypes, direct file/process APIs — none of which pass through
+    ``detect_dangerous_command()``'s pattern matching at all, so this branch
+    has a materially higher risk profile than the shell-command fallback.
+    One authorization must not silently cover both; an operator who
+    intentionally trusts headless shell commands has NOT thereby also
+    authorized headless arbitrary-code execution.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+        mode = str(
+            cfg_get(
+                config, "approvals", "execute_code_noninteractive_mode",
+                default="block",
+            )
+        ).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "block"
+    except Exception:
+        return "block"
+
+
 def check_execute_code_guard(code: str, env_type: str,
                              has_host_access: bool = False) -> dict:
     """Approve an execute_code script before its child process is spawned.
@@ -5358,13 +5494,17 @@ def check_execute_code_guard(code: str, env_type: str,
     the script as a whole before it runs (#30882). Returns the same dict
     contract as ``check_all_command_guards``.
 
-    Scope (documented limitation, #30882): in a purely local non-interactive
-    non-gateway session (no TTY, not gateway, not cron-deny) this returns
-    approved — matching the existing terminal auto-approve contract. The
-    hardline floor still blocks catastrophic ``terminal()`` commands the script
-    issues; running arbitrary code headlessly without any approval surface is
-    trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
-    require approval).
+    Non-interactive, non-gateway, non-cron, non-single-query contexts (a bare
+    script with no TTY/gateway/cron-deny/-q approval surface reachable) now
+    fail CLOSED by default (see the 2026-08-29 approval-fallback exposure
+    audit — this branch was previously silent-and-fail-open, citing #30882's
+    now-superseded "existing terminal auto-approve contract" as rationale;
+    that contract was itself proven to be a bug and removed). Set
+    ``approvals.execute_code_noninteractive_mode: approve`` in config.yaml to
+    restore auto-approve for a specific known, explicitly-authorized
+    non-interactive execute_code workflow. This key is deliberately separate
+    from ``approvals.dangerous_command_noninteractive_mode`` (shell commands)
+    given execute_code's materially higher, uninspected risk surface.
     """
     pattern_key = "execute_code"
     description = (
@@ -5448,7 +5588,43 @@ def check_execute_code_guard(code: str, env_type: str,
     # the script's own per-call terminal() guards are handled separately in
     # check_all_command_guards.
     if not is_gateway and not is_ask:
-        return {"approved": True, "message": None}
+        if is_cli:
+            # CLI interactive: NOT the fail-open gap this fix targets. A
+            # human is present; this script's own terminal() calls are
+            # guarded per-call via propagated approval context (#33057).
+            # A whole-script prompt here would fire redundantly on every
+            # execute_code call, which is why CLI intentionally reaches
+            # this branch without a whole-script gate.
+            return {"approved": True, "message": None}
+        logger.warning(
+            "AUTO-APPROVED execute_code script in non-interactive "
+            "non-gateway context (pattern: %s): %s — no interactive "
+            "user/gateway/cron/single-query context present; BLOCKED "
+            "(fail-closed). Set "
+            "approvals.execute_code_noninteractive_mode: approve in "
+            "config.yaml to restore auto-approve for this specific known "
+            "non-interactive execute_code workflow.",
+            pattern_key, description,
+        )
+        if _get_execute_code_noninteractive_mode() == "approve":
+            return {"approved": True, "message": None}
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: {description} No interactive user, gateway, cron, "
+                "or single-query context is present to approve it. "
+                "execute_code runs arbitrary local Python that bypasses "
+                "shell-command pattern detection entirely, so this fails "
+                "closed rather than proceeding unattended. To allow this "
+                "specific known non-interactive workflow, set "
+                "approvals.execute_code_noninteractive_mode: approve in "
+                "config.yaml."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "blocked",
+            "user_consent": False,
+        }
 
     session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval

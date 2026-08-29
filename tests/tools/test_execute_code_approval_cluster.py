@@ -170,14 +170,16 @@ def test_guard_isolated_backend_approved():
     assert A.check_execute_code_guard("import os", "docker")["approved"] is True
 
 
-def test_guard_headless_local_approved(monkeypatch):
-    # Documented #30882 limitation: no approval surface → preserve auto-run.
+def test_guard_headless_local_now_fails_closed(monkeypatch):
+    # Superseded #30882 "documented limitation" — that fail-open contract
+    # was proven to be the exact bug this fix closes (2026-08-29 audit,
+    # Phase 4 priority item). No approval surface reachable now blocks.
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
-    assert A.check_execute_code_guard("import os", "local")["approved"] is True
+    assert A.check_execute_code_guard("import os", "local")["approved"] is False
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
@@ -196,6 +198,13 @@ def test_guard_cron_deny_blocks(monkeypatch):
 
 
 def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
+    """The env-var MASKING logic under test here (leaked HERMES_CRON_SESSION=1
+    correctly overridden by an explicit blank session-var context, resolving
+    to 'not cron') still works correctly — confirmed by the WARNING log
+    line firing with the correct non-cron framing. What changed is the
+    post-masking outcome: 'not cron' with no other approval surface now
+    fails closed by default (2026-08-29 audit, Phase 4 priority item)
+    rather than the old silent auto-approve."""
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
@@ -209,7 +218,7 @@ def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
     finally:
         clear_session_vars(tokens)
         reset_session_vars()
-    assert res["approved"] is True
+    assert res["approved"] is False
 
 
 def test_guard_legacy_env_cron_still_blocks(monkeypatch):
