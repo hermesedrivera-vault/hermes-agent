@@ -2912,13 +2912,88 @@ def _sync_with_upstream_if_needed(
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return False
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, merge instead of
+    # skipping (2026-09-06, Ed's explicit ask): a plain git merge is
+    # additive by construction — it creates a new commit with BOTH
+    # histories as ancestors. Nothing is ever deleted; a merge cannot
+    # "lose" a commit the way a reset can. Only risk is a genuine content
+    # conflict (same line changed on both sides), which git refuses to
+    # guess at — abort cleanly and hand it to a human rather than picking
+    # a side automatically.
     if origin_ahead > 0:
+        if upstream_ahead == 0:
+            print()
+            print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
+            print("  Fork already contains everything upstream has — nothing to merge.")
+            return True
+
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        print(
+            f"→ Fork has {origin_ahead} local-only commit(s) and is "
+            f"{upstream_ahead} commit(s) behind upstream — attempting merge..."
+        )
+
+        pre_merge_sha = _capture_head_sha(git_cmd, cwd)
+        safety_tag = _create_pre_reset_safety_tag(git_cmd, cwd, pre_merge_sha)
+        if safety_tag:
+            print(f"  ✓ Safety tag created: {safety_tag} (rollback: git reset --hard {safety_tag})")
+        else:
+            print("  ⚠ Could not create a safety tag — proceeding anyway (merge is additive; a tag is belt-and-suspenders, not required for safety).")
+
+        merge_result = subprocess.run(
+            git_cmd + ["merge", "--no-ff", "upstream/main",
+                       "-m", "Merge upstream/main into fork (hermes update)"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+
+        if merge_result.returncode != 0:
+            # Conflict or other merge failure — abort cleanly, touch
+            # nothing, hand off to a human. Never guess at a resolution.
+            subprocess.run(
+                git_cmd + ["merge", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            print("  ✗ Merge hit conflicts — aborted cleanly, nothing changed.")
+            stderr_tail = (merge_result.stdout or merge_result.stderr or "").strip()
+            if stderr_tail:
+                print(f"    {stderr_tail.splitlines()[-1]}")
+            print("  Your fork-only commits and upstream's commits are both")
+            print("  still safe in git history — only the automatic merge was")
+            print("  skipped. Resolve by hand:")
+            print(f"    cd {cwd} && git merge upstream/main")
+            print("    (fix the conflicting files, then git add + git commit)")
+            return True
+
+        # Merge landed clean. Verify our local-only commits are STILL
+        # ancestors of the new HEAD — the exact fact Ed asked hermes
+        # update to prove on every run, checked here immediately after
+        # the operation that could theoretically have gotten it wrong.
+        post_merge_sha = _capture_head_sha(git_cmd, cwd)
+        ancestor_check_ok = True
+        if pre_merge_sha and post_merge_sha:
+            verify = subprocess.run(
+                git_cmd + ["merge-base", "--is-ancestor", pre_merge_sha, post_merge_sha],
+                cwd=cwd,
+                capture_output=True,
+            )
+            ancestor_check_ok = verify.returncode == 0
+        if not ancestor_check_ok:
+            print("  🔴 Merge completed but pre-merge HEAD is not an ancestor of the result.")
+            print(f"    This should be structurally impossible for a merge. Recover: git reset --hard {safety_tag or pre_merge_sha}")
+            return True
+
+        print(f"  ✓ Merged cleanly — {upstream_ahead} upstream commit(s) now in your fork, all {origin_ahead} of your commits intact.")
+
+        print("→ Syncing fork...")
+        if _sync_fork_with_upstream(git_cmd, cwd):
+            print("  ✓ Fork synced with upstream on GitHub")
+        else:
+            print("  ℹ Merged locally but couldn't push to your fork (no write access?)")
+            print("    Your local repo is updated, but your fork on GitHub may be behind.")
         return True
 
     # If upstream is not ahead, fork is up to date
