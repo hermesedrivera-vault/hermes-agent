@@ -26,14 +26,17 @@ def _clean_approval_state():
 
 
 def _session_ctx(session_key="s1", task_id="t1", subagent_id=""):
+    session_token = approval.set_current_session_key(session_key)
     tokens = approval.set_current_authorization_scope(
-        session_key=session_key, task_id=task_id, subagent_id=subagent_id
+        task_id=task_id, subagent_id=subagent_id
     )
-    return tokens
+    return (session_token, tokens)
 
 
 def _reset(tokens):
-    approval.reset_current_authorization_scope(tokens)
+    session_token, scope_tokens = tokens
+    approval.reset_current_authorization_scope(scope_tokens)
+    approval.reset_current_session_key(session_token)
 
 
 def _mock_gate_approved():
@@ -177,7 +180,7 @@ class TestMissingIdentityFailsClosed:
     def test_missing_session_identity_fails_closed(self):
         # No session_ctx established -- real default-key fail-closed path.
         tokens = approval.set_current_authorization_scope(
-            session_key="", task_id="", subagent_id=""
+            task_id="", subagent_id=""
         )
         try:
             result = approval.check_mcp_call_guard("srv", "delete_file", {"path": "/a"})

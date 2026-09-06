@@ -4393,6 +4393,13 @@ def check_outbound_comm_guard(tool_name, text_for_detection, channel_recipient_o
                 "requires approval but no interactive user or gateway is "
                 "present to approve it. Action NOT sent."
             ),
+            single_query_deny_message=(
+                f"BLOCKED: Outbound {channel} communication to {recipient_key} "
+                "but single-query mode (-q) runs without a user present to "
+                "approve it. Find an alternative approach that avoids this "
+                "send. To allow outbound communication in single-query mode, "
+                "set approvals.single_query_mode: approve in config.yaml."
+            ),
         )
 
         if not decision.get("approved", False) and mode == "shadow":
@@ -4586,6 +4593,14 @@ def check_mcp_call_guard(
                 f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
                 f"'{server_name}' requires approval but no interactive user "
                 "or gateway is present to approve it. The call was NOT run."
+            ),
+            single_query_deny_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but single-query mode "
+                "(-q) runs without a user present to approve it. Find an "
+                "alternative approach that avoids this call. To allow "
+                "untrusted MCP write-capable calls in single-query mode, set "
+                "approvals.single_query_mode: approve in config.yaml."
             ),
         )
         return decision

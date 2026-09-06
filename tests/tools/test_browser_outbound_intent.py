@@ -29,11 +29,11 @@ def _clean_intent_state():
 
 @pytest.fixture
 def session_ctx():
-    tokens = approval.set_current_authorization_scope(
-        session_key="test_session_step43", task_id="t1", subagent_id=""
-    )
+    session_token = approval.set_current_session_key("test_session_step43")
+    tokens = approval.set_current_authorization_scope(task_id="t1", subagent_id="")
     yield "test_session_step43"
     approval.reset_current_authorization_scope(tokens)
+    approval.reset_current_session_key(session_token)
 
 
 def _no_intent_check_stub():
@@ -87,7 +87,7 @@ def test_declare_intent_missing_channel_fails_closed(session_ctx):
 
 def test_declare_intent_missing_session_identity_fails_closed():
     # No session_ctx fixture used -- exercises real default-key fail-closed path.
-    tokens = approval.set_current_authorization_scope(session_key="", task_id="", subagent_id="")
+    tokens = approval.set_current_authorization_scope(task_id="", subagent_id="")
     try:
         result = json.loads(declare_outbound_intent_tool(channel="gmail", recipient="alice@example.com"))
         assert result.get("success") is not True
@@ -313,13 +313,16 @@ def test_clear_session_removes_intent(session_ctx):
 # ---------------------------------------------------------------------------
 
 def test_intent_does_not_leak_across_authorization_keys():
-    tokens_a = approval.set_current_authorization_scope(session_key="session_a", task_id="t1", subagent_id="")
+    session_token_a = approval.set_current_session_key("session_a")
+    tokens_a = approval.set_current_authorization_scope(task_id="t1", subagent_id="")
     try:
         declare_outbound_intent_tool(channel="gmail", recipient="alice@example.com")
     finally:
         approval.reset_current_authorization_scope(tokens_a)
+        approval.reset_current_session_key(session_token_a)
 
-    tokens_b = approval.set_current_authorization_scope(session_key="session_b", task_id="t1", subagent_id="")
+    session_token_b = approval.set_current_session_key("session_b")
+    tokens_b = approval.set_current_authorization_scope(task_id="t1", subagent_id="")
     try:
         with patch("tools.approval.check_outbound_comm_guard", side_effect=_approve_gate) as mock_guard:
             result = json.loads(browser_confirm_outbound_action_tool(channel="gmail", recipient="alice@example.com"))
@@ -327,6 +330,7 @@ def test_intent_does_not_leak_across_authorization_keys():
         mock_guard.assert_not_called()
     finally:
         approval.reset_current_authorization_scope(tokens_b)
+        approval.reset_current_session_key(session_token_b)
         approval._browser_outbound_intent.pop("session_a::task=t1::sub=", None)
 
 

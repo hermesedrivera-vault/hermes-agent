@@ -30,11 +30,11 @@ import tools.approval as approval
 
 @pytest.fixture
 def session_ctx():
-    tokens = approval.set_current_authorization_scope(
-        session_key="test_session_step50", task_id="t1", subagent_id=""
-    )
+    session_token = approval.set_current_session_key("test_session_step50")
+    tokens = approval.set_current_authorization_scope(task_id="t1", subagent_id="")
     yield "test_session_step50"
     approval.reset_current_authorization_scope(tokens)
+    approval.reset_current_session_key(session_token)
 
 from gateway.config import Platform
 from tools.send_message_tool import (

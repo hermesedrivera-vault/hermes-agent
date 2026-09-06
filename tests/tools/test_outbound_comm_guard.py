@@ -476,11 +476,16 @@ def test_execute_code_static_outbound_detection():
 
 def test_execute_code_no_outbound_signal_reaches_local_early_return():
     """Sanity check: code with no outbound signal is unaffected by the new
-    gate and still hits the documented local-context early return (approved).
-    """
+    outbound-comm gate. As of the 2026-08-29 fail-open audit fix
+    (f730da0d08), check_execute_code_guard's own non-interactive fallback
+    now fails CLOSED (not auto-approved) with no gateway/cron/single-query
+    context present -- that's an intentional, unrelated security fix, not
+    a regression from the outbound-comm guard added here. This test only
+    asserts the outbound-comm gate itself did not additionally block."""
     reset_session_vars()
     result = check_execute_code_guard("import os\nprint('hi')\n", "local")
-    assert result["approved"] is True
+    assert result["approved"] is False
+    assert "non-interactive" in result["message"] or "fail-closed" in result["message"].lower()
 
 
 # ---------------------------------------------------------------------------

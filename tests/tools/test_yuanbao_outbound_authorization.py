@@ -13,11 +13,11 @@ from tools.yuanbao_tools import send_dm, send_sticker
 
 @pytest.fixture
 def session_ctx():
-    tokens = approval.set_current_authorization_scope(
-        session_key="test_session_step48", task_id="t1", subagent_id=""
-    )
+    session_token = approval.set_current_session_key("test_session_step48")
+    tokens = approval.set_current_authorization_scope(task_id="t1", subagent_id="")
     yield "test_session_step48"
     approval.reset_current_authorization_scope(tokens)
+    approval.reset_current_session_key(session_token)
 
 
 def _approve_gate(*args, **kwargs):
@@ -176,7 +176,7 @@ def test_no_permanent_approval_override_introduced(session_ctx):
 def test_missing_session_identity_fails_closed():
     # No session_ctx fixture -- exercises the real check_outbound_comm_guard
     # default-identity fail-closed path (no mocking of the guard itself).
-    tokens = approval.set_current_authorization_scope(session_key="", task_id="", subagent_id="")
+    tokens = approval.set_current_authorization_scope(task_id="", subagent_id="")
     adapter = _make_adapter()
     try:
         with patch("tools.yuanbao_tools._get_active_adapter", return_value=adapter):

@@ -18,11 +18,11 @@ from tools.send_message_tool import _parse_target_ref, send_message_tool
 
 @pytest.fixture
 def session_ctx():
-    tokens = approval.set_current_authorization_scope(
-        session_key="test_session_step50", task_id="t1", subagent_id=""
-    )
+    session_token = approval.set_current_session_key("test_session_step50")
+    tokens = approval.set_current_authorization_scope(task_id="t1", subagent_id="")
     yield "test_session_step50"
     approval.reset_current_authorization_scope(tokens)
+    approval.reset_current_session_key(session_token)
 
 
 def _run_async_immediately(coro):
@@ -77,7 +77,7 @@ def test_send_message_routes_whatsapp_group_jid_without_home_fallback(session_ct
     )
 
 
-def test_resolved_opaque_plugin_target_uses_directory_id() -> None:
+def test_resolved_opaque_plugin_target_uses_directory_id(session_ctx) -> None:
     from gateway.platform_registry import PlatformEntry, platform_registry
 
     platform_name = "opaque-resolved-test"
@@ -131,7 +131,7 @@ def test_resolved_opaque_plugin_target_uses_directory_id() -> None:
     )
 
 
-def test_unresolved_plugin_target_requires_explicit_parser() -> None:
+def test_unresolved_plugin_target_requires_explicit_parser(session_ctx) -> None:
     from gateway.platform_registry import PlatformEntry, platform_registry
 
     platform_name = "opaque-verbatim-test"
@@ -189,7 +189,7 @@ def test_unresolved_plugin_target_requires_explicit_parser() -> None:
     send_mock.assert_not_awaited()
 
 
-def test_unresolved_builtin_target_keeps_directory_error() -> None:
+def test_unresolved_builtin_target_keeps_directory_error(session_ctx) -> None:
     telegram_cfg = SimpleNamespace(enabled=True, token="***", extra={})
     config = SimpleNamespace(
         platforms={Platform.TELEGRAM: telegram_cfg},
