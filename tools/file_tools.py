@@ -2549,6 +2549,44 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     return None
 
 
+def _mint_write_provenance(resolved_path: str, tool_name: str, session_id: str | None,
+                            mode: str = "write") -> None:
+    """Mint a provenance receipt for a confirmed file-write side effect.
+
+    Provenance Phase 1 (2026-09-06): expands receipt coverage beyond
+    read_file/search_files/terminal/web_search to the write/patch surface.
+    Caller MUST only invoke this after confirming the write succeeded
+    (result_dict has no "error") — minting on a failed write would let a
+    failure masquerade as a completed write, the same trap search_files'
+    error-guard already avoids for reads. Non-fatal on any internal error;
+    a broken mint must never break the write it's recording.
+    """
+    if not session_id or not resolved_path:
+        return
+    try:
+        from agent.provenance.gate import get_evidence_store
+        import hashlib as _hashlib
+        store = get_evidence_store()
+        if not store:
+            return
+        try:
+            with open(resolved_path, "r", encoding="utf-8", errors="ignore") as _f:
+                new_hash = _hashlib.sha256(_f.read().encode()).hexdigest()
+        except Exception:
+            new_hash = None
+        store.mint(
+            claim_id=f"{tool_name}.{resolved_path}",
+            source_uri=f"file://{resolved_path}",
+            content={"path": resolved_path, "mode": mode, "new_content_hash": new_hash},
+            session_id=session_id,
+            tool_name=tool_name,
+            ttl_seconds=300,
+            facts={"path": resolved_path, "mode": mode, "mutated": True},
+        )
+    except Exception as prov_err:
+        logger.debug(f"{tool_name} provenance mint failed (non-fatal): {prov_err}")
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2620,6 +2658,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 result_dict["_warning"] = stale_warning
             if not result_dict.get("error"):
                 _mark_verification_stale(task_id, [path], session_id=session_id)
+                _mint_write_provenance(path, "write_file", session_id or task_id)
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -2647,6 +2686,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             if not result_dict.get("error"):
                 result_dict["files_modified"] = [_resolved]
                 _mark_verification_stale(task_id, [_resolved], session_id=session_id)
+                _mint_write_provenance(_resolved, "write_file", session_id or task_id)
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
             _update_read_timestamp(path, task_id)
@@ -2864,6 +2904,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _reset_patch_failures(task_id, [
                     _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
                 ])
+                # Provenance (Phase 1 coverage expansion, 2026-09-06): mint
+                # a receipt for each patched file's write side-effect. Only
+                # reached inside the confirmed-success (`not error`) branch.
+                _sid = session_id or task_id
+                for _p in _resolved_modified:
+                    _mint_write_provenance(_p, "patch", _sid, mode=mode)
         # Hint when old_string not found — saves iterations where the agent
         # retries with stale content instead of re-reading the file.
         # Suppressed when patch_replace already attached a rich "Did you mean?"
