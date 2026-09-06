@@ -10740,6 +10740,35 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
+def _print_update_integrity_result() -> None:
+    """Print the fork-safety verdict for the run that just finished.
+
+    Called unconditionally at every command-boundary exit of
+    ``cmd_update`` (success, sys.exit, and unhandled exception) — never
+    something Ed or Hermes has to remember to ask for separately
+    (2026-09-06: his core complaint about the prior manual-check-only
+    state). Reads back the just-finalized receipt rather than
+    recomputing, so this prints exactly what was captured at
+    begin/finalize time. Never raises — a print failure here must not
+    mask the real update outcome.
+    """
+    try:
+        from hermes_cli.update_receipt import (
+            format_update_integrity_line,
+            read_latest_receipt,
+        )
+
+        receipt = read_latest_receipt()
+        if not receipt:
+            return
+        line = format_update_integrity_line(receipt)
+        if line:
+            print()
+            print(line)
+    except Exception:
+        pass
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -10844,6 +10873,7 @@ def cmd_update(args):
             finalize_pending_update_receipt(_code, f"sys.exit({_code})")
         except Exception:
             pass
+        _print_update_integrity_result()
         _update_handoff_exit_code = (
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
@@ -10857,6 +10887,7 @@ def cmd_update(args):
             )
         except Exception:
             pass
+        _print_update_integrity_result()
         raise
     else:
         try:
@@ -10865,6 +10896,7 @@ def cmd_update(args):
             finalize_pending_update_receipt(0, "completed at command boundary")
         except Exception:
             pass
+        _print_update_integrity_result()
         _update_handoff_exit_code = 0
     finally:
         _update_lock.release()

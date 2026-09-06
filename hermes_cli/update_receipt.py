@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -51,6 +52,128 @@ _current: Optional["UpdateReceipt"] = None
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _capture_divergence_snapshot() -> dict[str, Any]:
+    """Snapshot the two counts a fork-safety verification needs.
+
+    Never raises; every field degrades to ``None`` (unverifiable) rather
+    than a misleading 0/false. Reuses ``update_cmd``'s existing helpers
+    (``_local_only_commits``, ``_count_commits_between``, ``_is_fork``,
+    ``_has_upstream_remote``) instead of re-implementing git plumbing —
+    single source of truth for what "local-only" and "behind upstream"
+    mean, matching the STEP 70 reset-guard's own definitions exactly.
+
+    Shape: ``{"is_fork": bool | None, "branch": str | None,
+    "local_only_vs_origin": int | None, "fork_behind_upstream": int | None,
+    "has_upstream_remote": bool | None}``. A ``None`` count means the
+    check itself could not run (git failure, no upstream remote, detached
+    HEAD) — callers MUST print that as "unverifiable", never as 0.
+    """
+    result: dict[str, Any] = {
+        "is_fork": None,
+        "branch": None,
+        "local_only_vs_origin": None,
+        "fork_behind_upstream": None,
+        "has_upstream_remote": None,
+    }
+    try:
+        from hermes_cli.main import PROJECT_ROOT
+        from hermes_cli.update_cmd import (
+            _count_commits_between,
+            _get_origin_url,
+            _has_upstream_remote,
+            _is_fork,
+            _local_only_commits,
+        )
+
+        git_cmd = ["git"]
+        cwd = PROJECT_ROOT
+        branch_result = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        branch = branch_result.stdout.strip()
+        if branch and branch != "HEAD":  # HEAD means detached — no branch ref
+            result["branch"] = branch
+
+        origin_url = _get_origin_url(git_cmd, cwd)
+        result["is_fork"] = _is_fork(origin_url) if origin_url else None
+
+        if result["branch"]:
+            commits, reason = _local_only_commits(
+                git_cmd, cwd, result["branch"], f"origin/{result['branch']}"
+            )
+            result["local_only_vs_origin"] = len(commits) if commits is not None else None
+
+        has_upstream = _has_upstream_remote(git_cmd, cwd)
+        result["has_upstream_remote"] = has_upstream
+        if has_upstream and result["is_fork"]:
+            fetch = subprocess.run(
+                git_cmd + ["fetch", "upstream", "main", "--quiet"],
+                cwd=cwd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
+            if fetch.returncode == 0:
+                behind = _count_commits_between(
+                    git_cmd, cwd, "origin/main", "upstream/main"
+                )
+                result["fork_behind_upstream"] = behind if behind >= 0 else None
+    except Exception as exc:  # pragma: no cover - defensive, never block update
+        logger.debug("Divergence snapshot failed: %s", exc)
+    return result
+
+
+def format_update_integrity_line(receipt_data: dict[str, Any]) -> Optional[str]:
+    """Build the one line ``hermes update`` prints proving fork safety.
+
+    Reads ``divergence_pre``/``divergence_post`` off a finalized receipt's
+    ``.data`` dict and renders a verdict the user can trust without
+    needing to ask Hermes to go dig through git history by hand (2026-09-06:
+    Ed's core complaint — the safety check existed but only Hermes checking
+    manually surfaced it). Returns ``None`` when nothing was captured (very
+    old receipt, non-git checkout) rather than fabricating a verdict.
+    """
+    pre = receipt_data.get("divergence_pre") or {}
+    post = receipt_data.get("divergence_post") or {}
+    if not pre and not post:
+        return None
+
+    lines = []
+    local_pre = pre.get("local_only_vs_origin")
+    local_post = post.get("local_only_vs_origin")
+    if local_pre is None or local_post is None:
+        lines.append("⚠ Local-commit safety: UNVERIFIABLE (git check failed — do not assume safe)")
+    elif local_post < local_pre:
+        lines.append(
+            f"🔴 Local-commit safety: {local_pre - local_post} local-only "
+            f"commit(s) DISAPPEARED this run ({local_pre} → {local_post}). "
+            "Investigate immediately — this is the exact failure class that "
+            "lost work before."
+        )
+    else:
+        lines.append(
+            f"✓ Local-commit safety: {local_post} commit(s) not on your fork "
+            "yet, all still present — none discarded."
+        )
+
+    behind = post.get("fork_behind_upstream")
+    if behind is None:
+        behind = pre.get("fork_behind_upstream")
+    if behind is not None:
+        if behind > 0:
+            plural = "commit" if behind == 1 else "commits"
+            lines.append(
+                f"⚠ Your fork is {behind} {plural} behind the official "
+                "NousResearch/hermes-agent upstream — this update only "
+                "synced with YOUR fork, not upstream. Run "
+                "'git pull upstream main' to merge upstream fixes."
+            )
+        else:
+            lines.append("✓ Fork is at parity with upstream — no missed updates.")
+
+    return "\n".join(lines)
 
 
 class UpdateReceipt:
@@ -77,6 +200,15 @@ class UpdateReceipt:
             self.data["pre_update"] = get_code_identity()
         except Exception:
             pass
+        # Divergence snapshot (2026-09-06, Ed's fork-safety concern): the
+        # STEP 70 guards correctly REFUSE a destructive reset that would
+        # discard local-only commits, but nothing previously proved that
+        # refusal to the user in hermes update's own output — only a
+        # CLI-startup banner (format_fork_behind_upstream_line) that a
+        # gateway/Telegram-driven session never sees. Capture BEFORE any
+        # git mutation so finalize() can compare and the printed line is
+        # never a guess about what "should" have happened.
+        self.data["divergence_pre"] = _capture_divergence_snapshot()
 
     # -- recording ---------------------------------------------------------
     def step(self, name: str, ok: bool, detail: str = "") -> None:
@@ -144,6 +276,12 @@ class UpdateReceipt:
             self.data["post_update"] = get_code_identity(refresh=True)
         except Exception:
             pass
+        # Post-run divergence snapshot (see __init__): compared against
+        # divergence_pre by format_update_integrity_line() to prove — not
+        # assume — that no local-only commit vanished this run, and to
+        # surface the fork-behind-upstream count hermes update itself
+        # previously never printed (2026-09-06).
+        self.data["divergence_post"] = _capture_divergence_snapshot()
 
 
 def _receipt_dir() -> Path:
@@ -152,11 +290,70 @@ def _receipt_dir() -> Path:
     return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
 
 
+def _inflight_snapshot_path() -> Path:
+    """Sidecar file surviving a mid-run ``sys.modules`` purge.
+
+    ``_current`` is a plain module-level global — ``_purge_stale_hermes_
+    modules()`` (2026-08-20 fix, update_cmd.py) deliberately evicts every
+    ``hermes_cli.*`` module mid-run so post-pull code reflects the fresh
+    checkout. That import purge creates a BRAND NEW ``update_receipt``
+    module object with its own fresh ``_current = None`` — silently
+    orphaning whatever the pre-purge module had recorded, with no
+    exception raised anywhere (confirmed 2026-09-06: ``_current is None``
+    by the time ``finalize_pending_update_receipt`` runs on the
+    ``_apply_pending_fleet_restart_catchup`` -> ``sys.exit(1)`` path,
+    even though ``begin_update_receipt()`` definitely ran earlier in the
+    same OS process). A module global cannot survive that; a file can.
+    """
+    from hermes_cli.config import get_hermes_home
+
+    return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME / ".inflight.json"
+
+
+def _write_inflight_snapshot(divergence_pre: dict[str, Any]) -> None:
+    """Best-effort persist of the one fact that must survive a purge."""
+    try:
+        path = _inflight_snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"pid": os.getpid(), "divergence_pre": divergence_pre},
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not write in-flight snapshot: %s", exc)
+
+
+def _read_and_clear_inflight_snapshot() -> Optional[dict[str, Any]]:
+    """Read back this process's pre-purge divergence snapshot, then delete it.
+
+    PID-scoped so a stale leftover from a crashed prior run (never
+    cleaned up) is never mistaken for the current run's data. Always
+    removes the file on the way out — one-shot, exactly like the
+    in-memory singleton it's substituting for.
+    """
+    try:
+        path = _inflight_snapshot_path()
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        path.unlink(missing_ok=True)
+        if data.get("pid") != os.getpid():
+            return None
+        return data.get("divergence_pre")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not read in-flight snapshot: %s", exc)
+        return None
+
+
 def begin_update_receipt() -> None:
     """Start recording a new update receipt. Never raises."""
     global _current
     try:
         _current = UpdateReceipt()
+        _write_inflight_snapshot(_current.data.get("divergence_pre") or {})
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
         _current = None
@@ -202,6 +399,16 @@ def finalize_update_receipt(
     global _current
     receipt = _current
     _current = None
+    # Best-effort cleanup: the in-flight snapshot's job ends the moment a
+    # receipt actually finalizes through the normal (non-purged) path —
+    # leaving it behind risks a LATER unrelated run misreading a stale
+    # snapshot if that run also hits the reconstruction path (PID reuse
+    # is astronomically unlikely, but there's no reason to leave the file
+    # sitting there once it's no longer needed).
+    try:
+        _inflight_snapshot_path().unlink(missing_ok=True)
+    except Exception:
+        pass
     if receipt is None:
         return None
     try:
@@ -250,9 +457,52 @@ def finalize_pending_update_receipt(
     Outcome mapping: exit 0/None → ``success`` (a path that completed
     without an explicit inner finalize), exit 2 → ``refused`` (the
     updater's preflight-refusal convention), anything else → ``failed``.
+
+    2026-09-06: ``_current`` can be ``None`` here not because no receipt
+    was ever begun, but because ``_purge_stale_hermes_modules()`` (see
+    ``_inflight_snapshot_path`` docstring) replaced this module with a
+    fresh copy mid-run, orphaning the real singleton. When that's the
+    case, the on-disk in-flight snapshot (written at ``begin_update_
+    receipt()`` time, before any purge could touch it) lets us still
+    write a real receipt for THIS run instead of silently reporting
+    nothing — with an honest note that per-step detail was lost to the
+    purge, not fabricating steps that didn't happen.
     """
+    global _current
     if _current is None:
-        return None
+        pre_snapshot = _read_and_clear_inflight_snapshot()
+        if pre_snapshot is None:
+            return None
+        try:
+            _current = UpdateReceipt.__new__(UpdateReceipt)
+            _current.data = {
+                "schema": 1,
+                "started_at": _utc_now_iso(),
+                "finished_at": None,
+                "argv": list(sys.argv),
+                "pid": os.getpid(),
+                "outcome": "running",
+                "pre_update": {},
+                "post_update": {},
+                "steps": [],
+                "skips": [],
+                "gateway_restart": {},
+                "fleet": [],
+                "divergence_pre": pre_snapshot,
+                "reconstructed_after_module_purge": True,
+                "reconstruction_note": (
+                    "The original receipt's step/skip history was lost when "
+                    "_purge_stale_hermes_modules() replaced this module "
+                    "mid-run. Only the pre-run divergence snapshot (written "
+                    "to disk before the purge could touch it) and a fresh "
+                    "post-run snapshot survive. This is not a fabricated "
+                    "receipt — every field present is real; fields this run "
+                    "cannot know are simply absent."
+                ),
+            }
+        except Exception as exc:
+            logger.debug("Could not reconstruct receipt after purge: %s", exc)
+            return None
     if exit_code in (0, None):
         outcome = "success"
     elif exit_code == 2:
