@@ -422,3 +422,56 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-06: leftover-PID fallback must escalate to SIGKILL like every
+# other _wait_for_gateway_exit call site, not silently give up after 5s.
+# ---------------------------------------------------------------------------
+
+
+def test_leftover_pid_fallback_escalates_to_sigkill(monkeypatch):
+    """Regression: this call site used to be timeout=5.0, force_after=None
+    — the lone non-intentional spot in the codebase that never escalates.
+    A gateway busy draining active sessions can need more than 5s; with no
+    force-kill, ``hermes update`` just gave up and left the fleet in
+    systemd's "deactivating" limbo (confirmed live 2026-09-06). Assert the
+    real call site now matches the pattern used everywhere else:
+    timeout=10.0, force_after=5.0.
+    """
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_gateway_pids", lambda **k: [12345]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.is_macos", lambda: False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.is_windows", lambda: False
+    )
+    monkeypatch.setattr(
+        update_cmd, "_restart_systemd_gateway_units_best_effort", lambda failed: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.kill_gateway_processes", lambda **k: None
+    )
+
+    calls = []
+
+    def fake_wait(timeout=None, force_after=None):
+        calls.append({"timeout": timeout, "force_after": force_after})
+        return True
+
+    monkeypatch.setattr(
+        "hermes_cli.gateway._wait_for_gateway_exit", fake_wait
+    )
+
+    result = update_cmd._run_pending_fleet_restart()
+
+    assert result is True
+    assert len(calls) == 1, "expected exactly one _wait_for_gateway_exit call"
+    assert calls[0]["timeout"] == 10.0, "timeout regressed below the safe window"
+    assert calls[0]["force_after"] == 5.0, (
+        "force_after regressed to None — this is the exact bug: no SIGKILL "
+        "escalation means a slow-draining gateway just sits in limbo forever"
+    )

@@ -3270,7 +3270,22 @@ def _run_pending_fleet_restart() -> bool:
         if leftover:
             try:
                 kill_gateway_processes(all_profiles=True)
-                _wait_for_gateway_exit(timeout=5.0, force_after=None)
+                # 2026-09-06 fix: this fallback previously used
+                # timeout=5.0, force_after=None — the only two
+                # non-intentional call sites in the codebase that never
+                # escalate to SIGKILL (every other _wait_for_gateway_exit
+                # call uses timeout=10.0, force_after=5.0; see that
+                # function's other callers). With no force-kill, a
+                # gateway that doesn't exit within the graceful window
+                # just sits there — confirmed live: the gateway serving
+                # this very session logged "PID still running after
+                # 5.0s — restart may fail" and then stayed in systemd's
+                # "deactivating" state for well over a minute afterward
+                # with nothing left to push it along, until manually
+                # restarted from outside the session. force_after=5.0
+                # gives graceful shutdown one real window, then forces
+                # the issue instead of leaving the fleet in limbo.
+                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
             except Exception as exc:
                 logger.debug("Pending fleet restart: PID stop failed: %s", exc)
         if failed:
