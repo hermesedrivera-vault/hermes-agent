@@ -427,8 +427,18 @@ def _cronjob(**kwargs):
     return _json.loads(cronjob(**kwargs))
 
 
-def test_tool_update_rejects_the_2026_08_03_destructive_shape(hermes_env):
-    """The exact call that wiped 43 jobs must now fail closed."""
+def test_tool_update_rejects_the_2026_08_03_destructive_shape(hermes_env, monkeypatch):
+    """The exact call that wiped 43 jobs must now fail closed.
+
+    DESTRUCTIVE_UPDATE_ARGS carries deliver="whatsapp" (the incident's
+    literal argument set) -- since 2026-09-06 that also passes through
+    check_cron_deliver_change_guard, which would otherwise fail this call
+    for an unrelated reason (no approval context) before the empty-payload
+    guard under test ever runs. HERMES_INTERACTIVE=1 + a mocked approval
+    callback isolates the empty-payload rejection this test actually
+    verifies."""
+    from unittest.mock import patch as _mock_patch
+    import tools.approval as approval
     from cron.jobs import create_job, get_job
 
     job = create_job(
@@ -440,7 +450,12 @@ def test_tool_update_rejects_the_2026_08_03_destructive_shape(hermes_env):
     )
     before = dict(get_job(job["id"]))
 
-    result = _cronjob(job_id=job["id"], **DESTRUCTIVE_UPDATE_ARGS)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    with _mock_patch.object(
+        approval, "_resolve_cli_approval_callback",
+        return_value=lambda *a, **k: "once",
+    ):
+        result = _cronjob(job_id=job["id"], **DESTRUCTIVE_UPDATE_ARGS)
 
     assert result["success"] is False
     assert "nothing to run" in result["error"]
@@ -453,8 +468,13 @@ def test_tool_update_rejects_the_2026_08_03_destructive_shape(hermes_env):
         assert after.get(field) == before.get(field), f"{field} was clobbered"
 
 
-def test_tool_update_rejects_the_destructive_shape_on_a_script_job(hermes_env):
-    """script:"" + prompt:"" + skills:[] empties an agent script job too."""
+def test_tool_update_rejects_the_destructive_shape_on_a_script_job(hermes_env, monkeypatch):
+    """script:"" + prompt:"" + skills:[] empties an agent script job too.
+
+    See test_tool_update_rejects_the_2026_08_03_destructive_shape for why
+    HERMES_INTERACTIVE + a mocked approval callback are needed here."""
+    from unittest.mock import patch as _mock_patch
+    import tools.approval as approval
     from cron.jobs import create_job, get_job
 
     (hermes_env / "scripts" / "w.sh").write_text("echo hi\n")
@@ -464,16 +484,26 @@ def test_tool_update_rejects_the_destructive_shape_on_a_script_job(hermes_env):
     )
     before = dict(get_job(job["id"]))
 
-    result = _cronjob(job_id=job["id"], **dict(DESTRUCTIVE_UPDATE_ARGS,
-                                              schedule="0 2 * * *"))
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    with _mock_patch.object(
+        approval, "_resolve_cli_approval_callback",
+        return_value=lambda *a, **k: "once",
+    ):
+        result = _cronjob(job_id=job["id"], **dict(DESTRUCTIVE_UPDATE_ARGS,
+                                                  schedule="0 2 * * *"))
 
     assert result["success"] is False
     assert "nothing to run" in result["error"]
     assert get_job(job["id"]) == before
 
 
-def test_tool_update_rejects_the_destructive_shape_on_a_no_agent_job(hermes_env):
-    """no_agent job: the more specific no_agent diagnosis reports first."""
+def test_tool_update_rejects_the_destructive_shape_on_a_no_agent_job(hermes_env, monkeypatch):
+    """no_agent job: the more specific no_agent diagnosis reports first.
+
+    See test_tool_update_rejects_the_2026_08_03_destructive_shape for why
+    HERMES_INTERACTIVE + a mocked approval callback are needed here."""
+    from unittest.mock import patch as _mock_patch
+    import tools.approval as approval
     from cron.jobs import create_job, get_job
 
     (hermes_env / "scripts" / "w.sh").write_text("echo hi\n")
@@ -483,9 +513,14 @@ def test_tool_update_rejects_the_destructive_shape_on_a_no_agent_job(hermes_env)
     )
     before = dict(get_job(job["id"]))
 
-    result = _cronjob(job_id=job["id"], **dict(DESTRUCTIVE_UPDATE_ARGS,
-                                              schedule="0 8 * * *",
-                                              no_agent=True))
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    with _mock_patch.object(
+        approval, "_resolve_cli_approval_callback",
+        return_value=lambda *a, **k: "once",
+    ):
+        result = _cronjob(job_id=job["id"], **dict(DESTRUCTIVE_UPDATE_ARGS,
+                                                  schedule="0 8 * * *",
+                                                  no_agent=True))
 
     assert result["success"] is False
     assert "script" in result["error"]

@@ -1570,15 +1570,39 @@ def cronjob(
                 create_job_with_scheduler_registration,
             )
 
+            _normalized_input_deliver = _normalize_deliver_param(deliver)
+            _resolved_deliver = _resolve_cron_context_deliver(
+                _normalized_input_deliver
+            )
+            from tools.approval import check_cron_deliver_change_guard
+            _deliver_decision = check_cron_deliver_change_guard(
+                job_id=None,
+                old_deliver=None,
+                # Gate against the PRE-resolution value the caller actually
+                # typed, not the resolved one. In a cron-context create,
+                # _resolve_cron_context_deliver rewrites 'origin' (or an
+                # omitted deliver) into the CREATING job's own concrete
+                # platform:chat_id -- that's the same target the creating
+                # run was already authorized to reach, not a new model-
+                # chosen recipient, and must not be re-gated just because
+                # it now looks like an explicit target after resolution.
+                new_deliver=_normalized_input_deliver,
+                is_create=True,
+            )
+            if not _deliver_decision.get("approved", False):
+                return tool_error(
+                    _deliver_decision.get("message")
+                    or "BLOCKED: cron delivery-target authorization denied. Job NOT created.",
+                    success=False,
+                )
+
             try:
                 job = create_job_with_scheduler_registration(
                     prompt=prompt or "",
                     schedule=schedule,
                     name=name,
                     repeat=repeat,
-                    deliver=_resolve_cron_context_deliver(
-                        _normalize_deliver_param(deliver)
-                    ),
+                    deliver=_resolved_deliver,
                     origin=_origin_from_env(),
                     skills=canonical_skills,
                     model=_normalize_optional_job_value(model),
@@ -1797,9 +1821,29 @@ def cronjob(
                 bot_chat_error = _validate_bot_chat_deliver(_normalize_deliver_param(deliver))
                 if bot_chat_error:
                     return tool_error(bot_chat_error, success=False)
-                updates["deliver"] = _resolve_cron_context_deliver(
-                    _normalize_deliver_param(deliver)
+                _normalized_input_new_deliver = _normalize_deliver_param(deliver)
+                _resolved_new_deliver = _resolve_cron_context_deliver(
+                    _normalized_input_new_deliver
                 )
+                _existing_job_for_deliver = get_job(job_id) or {}
+                from tools.approval import check_cron_deliver_change_guard
+                _deliver_decision = check_cron_deliver_change_guard(
+                    job_id=job_id,
+                    old_deliver=_existing_job_for_deliver.get("deliver"),
+                    # Same pre-resolution-value rule as create (see comment
+                    # there): gate against what was actually typed, not the
+                    # cron-context-resolved concrete target.
+                    new_deliver=_normalized_input_new_deliver,
+                    is_create=False,
+                )
+                if not _deliver_decision.get("approved", False):
+                    return tool_error(
+                        _deliver_decision.get("message")
+                        or "BLOCKED: cron delivery-target authorization denied. "
+                        "Update NOT applied.",
+                        success=False,
+                    )
+                updates["deliver"] = _resolved_new_deliver
             if skills is not None or skill is not None:
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills

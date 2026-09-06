@@ -2,6 +2,7 @@
 
 import json
 import pytest
+from unittest.mock import patch
 
 from tools.cronjob_tools import (
     _scan_cron_prompt,
@@ -345,7 +346,7 @@ class TestUnifiedCronjobTool:
         assert result["job"]["base_url"] == "https://legit.example/v1"
 
 
-    def test_create_normalizes_list_form_deliver(self):
+    def test_create_normalizes_list_form_deliver(self, monkeypatch):
         """deliver=['telegram'] (list) is stored as the string 'telegram'.
 
         Regression for #17139: MCP clients / scripts sometimes pass ``deliver``
@@ -353,36 +354,47 @@ class TestUnifiedCronjobTool:
         to ``jobs.json`` and the scheduler then tried to resolve the literal
         string ``"['telegram']"`` as a platform, failing with
         "no delivery target resolved".
+
+        An explicit deliver target now also passes through
+        check_cron_deliver_change_guard (2026-09-06) -- HERMES_INTERACTIVE=1
+        establishes an interactive context so the test exercises deliver
+        normalization, not the (separately tested) authorization gate.
         """
         from cron.jobs import get_job
 
-        created = json.loads(
-            cronjob(
-                action="create",
-                prompt="Daily briefing",
-                schedule="every 1h",
-                deliver=["telegram"],
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        with patch("tools.approval._resolve_cli_approval_callback",
+                   return_value=lambda *a, **k: "once"):
+            created = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="Daily briefing",
+                    schedule="every 1h",
+                    deliver=["telegram"],
+                )
             )
-        )
         assert created["success"] is True
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
 
 
-    def test_update_normalizes_list_form_deliver(self):
+    def test_update_normalizes_list_form_deliver(self, monkeypatch):
         """update with deliver=['telegram'] stores the canonical string."""
         from cron.jobs import get_job
 
         created = json.loads(
             cronjob(action="create", prompt="x", schedule="every 1h")
         )
-        updated = json.loads(
-            cronjob(
-                action="update",
-                job_id=created["job_id"],
-                deliver=["telegram"],
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        with patch("tools.approval._resolve_cli_approval_callback",
+                   return_value=lambda *a, **k: "once"):
+            updated = json.loads(
+                cronjob(
+                    action="update",
+                    job_id=created["job_id"],
+                    deliver=["telegram"],
+                )
             )
-        )
         assert updated["success"] is True
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"

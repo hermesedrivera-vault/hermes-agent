@@ -4616,6 +4616,134 @@ def check_mcp_call_guard(
         }
 
 
+def _cron_deliver_target_set(deliver: Optional[str]) -> frozenset:
+    """Normalize a cron `deliver` string into a comparable set of tokens.
+
+    Splits on commas, lowercases, strips whitespace. Used to compare an
+    old vs. new deliver value for drift purposes -- token-set equality,
+    not string equality, so re-ordering ('origin,all' -> 'all,origin')
+    is not flagged as drift.
+    """
+    if not deliver:
+        return frozenset({"local"})
+    return frozenset(
+        p.strip().lower() for p in str(deliver).split(",") if p.strip()
+    ) or frozenset({"local"})
+
+
+def check_cron_deliver_change_guard(
+    job_id: Optional[str],
+    old_deliver: Optional[str],
+    new_deliver: Optional[str],
+    is_create: bool,
+) -> dict:
+    """Authorization gate for a cron job's delivery-target changing to an
+    external/explicit recipient the model was not already approved to
+    reach for THIS job.
+
+    Threat model (2026-09-06, weekly-honesty-scorecard opportunity #3):
+    cron jobs run fully unattended -- there is no live human approving each
+    fire, so gating every DELIVERY (like check_outbound_comm_guard does for
+    a live send_message call) would block every legitimate scheduled report
+    under approvals.cron_mode: deny. The actual threat is narrower: the
+    model silently redirecting an existing job's delivery target (or
+    creating a new job aimed) at an external/explicit platform:chat_id it
+    was never separately authorized to reach. Human approval happens ONCE,
+    at the point the deliver target is set/changed -- not on every
+    subsequent unattended fire to an already-approved target.
+
+    Safe (never gated): 'local' (no delivery at all), 'origin' (resolves to
+    the CURRENT chat -- the human already present when this tool call is
+    made), 'all' (every home channel the human already configured in
+    config.yaml -- not a model-chosen recipient), and bot-chat targets
+    (machine-local, validated separately by _validate_bot_chat_deliver).
+    Gated: any explicit 'platform:chat_id[:thread_id]' token that is NEW
+    relative to the job's previously-stored deliver value (create: any
+    explicit token; update: only tokens not already present).
+
+    Returns {"approved": bool, "message": str|None} -- same contract as
+    check_dangerous_command/check_mcp_call_guard.
+    """
+    try:
+        if new_deliver is None:
+            return {"approved": True, "message": None}
+
+        _SAFE_TOKENS = {"local", "origin", "all"}
+
+        def _is_gated_token(tok: str) -> bool:
+            t = tok.strip().lower()
+            if not t or t in _SAFE_TOKENS:
+                return False
+            if t.startswith("bot-chat"):
+                return False
+            # Anything else (platform:chat_id[:thread_id]) is an explicit,
+            # model-chosen recipient -- gated unless already-approved (see
+            # drift check below).
+            return True
+
+        new_tokens = _cron_deliver_target_set(new_deliver)
+        gated_new = {t for t in new_tokens if _is_gated_token(t)}
+        if not gated_new:
+            return {"approved": True, "message": None}
+
+        if not is_create:
+            old_tokens = _cron_deliver_target_set(old_deliver)
+            gated_new = gated_new - old_tokens
+            if not gated_new:
+                # Every explicit target was already present before this
+                # update -- no NEW recipient introduced, nothing to gate.
+                return {"approved": True, "message": None}
+
+        recipient_key = ",".join(sorted(gated_new))
+        job_label = job_id or "<new job>"
+        pattern_key = f"cron_deliver_change::{job_label}::{recipient_key}"
+        description = (
+            f"Cron job '{job_label}' {'creating' if is_create else 'changing'} "
+            f"its delivery target to include: {recipient_key}"
+        )
+
+        decision = _run_approval_gate(
+            pattern_key=pattern_key,
+            description=description,
+            display_target=recipient_key,
+            cron_deny_message=(
+                f"BLOCKED: cron job '{job_label}' delivery target change to "
+                f"'{recipient_key}' but cron jobs run without a user present "
+                "to approve it. Find an alternative approach. To allow this "
+                "in cron jobs, set approvals.cron_mode: approve in config.yaml."
+            ),
+            autoapprove_log_prefix=(
+                "AUTO-APPROVED cron delivery-target change in non-interactive "
+                "non-gateway context"
+            ),
+            fail_closed_when_no_human=True,
+            allow_permanent=False,
+            no_human_block_message=(
+                f"BLOCKED: cron job '{job_label}' delivery target change to "
+                f"'{recipient_key}' requires approval but no interactive user "
+                "or gateway is present to approve it. Change NOT applied."
+            ),
+            single_query_deny_message=(
+                f"BLOCKED: cron job '{job_label}' delivery target change to "
+                f"'{recipient_key}' but single-query mode (-q) runs without a "
+                "user present to approve it. Find an alternative approach. "
+                "To allow this in single-query mode, set "
+                "approvals.single_query_mode: approve in config.yaml."
+            ),
+        )
+        return decision
+    except Exception as exc:
+        logger.exception("check_cron_deliver_change_guard raised -- failing CLOSED")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: cron delivery-target authorization check failed "
+                f"with an internal error ({exc}). This is a fail-closed "
+                "default -- the delivery-target change was NOT applied."
+            ),
+        }
+
+
 # =========================================================================
 # Browser outbound intent state machine (Step 42/43)
 # =========================================================================

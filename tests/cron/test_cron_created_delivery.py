@@ -116,7 +116,15 @@ class TestCronContextDeliveryResolution:
             _exit_cron_context(tokens, extra)
         assert result["deliver"] == "telegram:-100123456:17,all"
 
-    def test_explicit_target_passes_through_verbatim(self, temp_cron_home):
+    def test_explicit_target_passes_through_verbatim(self, temp_cron_home, monkeypatch):
+        """An explicit non-origin target (e.g. discord:#engineering) passes
+        through resolution unchanged. Genuinely new/explicit external
+        targets are gated by check_cron_deliver_change_guard (2026-09-06)
+        -- approvals.cron_mode: approve here isolates the resolution
+        behavior under test from that (separately tested) authorization
+        gate."""
+        import tools.approval as approval
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
         tokens, extra = _enter_cron_context("telegram", "-100999", "3")
         try:
             result = _create(deliver="discord:#engineering")
