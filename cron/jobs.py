@@ -2813,6 +2813,48 @@ def _mark_job_run_locked(
                     job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Provenance (Phase 1 coverage expansion, 2026-09-06): mint
+                # cron_execution + cron_delivery receipts here rather than
+                # scattered across run_job/_deliver_result's many internal
+                # return points — this is the single locked point every
+                # completed run passes through exactly once, with
+                # success/error/delivery_error already resolved. Non-fatal;
+                # a broken mint must never break job-state bookkeeping.
+                try:
+                    from agent.provenance.gate import get_evidence_store
+                    _store = get_evidence_store()
+                    if _store:
+                        _sid = f"cron:{job_id}"
+                        _store.mint(
+                            claim_id=f"cron_execution.{job_id}.{now}",
+                            source_uri=f"cron://{job_id}",
+                            content={"job_id": job_id, "success": success,
+                                     "error": error, "status": status},
+                            session_id=_sid,
+                            tool_name="cron_execution",
+                            ttl_seconds=300,
+                            facts={"job_id": job_id, "success": bool(success)},
+                        )
+                        _store.mint(
+                            claim_id=f"cron_delivery.{job_id}.{now}",
+                            source_uri=f"cron://{job_id}",
+                            content={"job_id": job_id,
+                                     "delivery_error": delivery_error},
+                            session_id=_sid,
+                            tool_name="cron_delivery",
+                            ttl_seconds=300,
+                            # NOTE: delivery_error is None means either (a) delivery
+                            # succeeded, or (b) no delivery target was configured
+                            # (deliver=local) — those are indistinguishable at this
+                            # call site. Do NOT claim "delivered: true" here; that
+                            # would fabricate a positive delivery claim for jobs
+                            # that never attempted one. Only assert the negative
+                            # fact we actually know: whether an error occurred.
+                            facts={"job_id": job_id,
+                                   "delivery_error_occurred": delivery_error is not None},
+                        )
+                except Exception as _prov_err:
+                    logger.debug(f"cron provenance mint failed (non-fatal): {_prov_err}")
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
