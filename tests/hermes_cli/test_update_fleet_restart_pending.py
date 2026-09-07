@@ -475,3 +475,43 @@ def test_leftover_pid_fallback_escalates_to_sigkill(monkeypatch):
         "force_after regressed to None — this is the exact bug: no SIGKILL "
         "escalation means a slow-draining gateway just sits in limbo forever"
     )
+
+
+def test_receipt_finalized_before_fleet_restart_can_self_kill(
+    monkeypatch, tmp_path, capsys
+):
+    """A ``hermes update`` CLI process can be a cgroup-mate of the gateway it is
+    updating (e.g. a terminal spawned from inside a running gateway process).
+    ``systemctl restart hermes-gateway`` (KillMode=mixed) then SIGTERMs the
+    whole cgroup, including this CLI process, mid-restart.
+
+    The receipt must be finalized and written to disk BEFORE
+    ``_apply_pending_fleet_restart_catchup()`` is called on the "already up
+    to date" path — otherwise a self-inflicted kill during the restart
+    leaves an orphaned ``.inflight.json`` and no closing receipt for a run
+    that actually succeeded.
+    """
+    args = _update_args()
+    _patch_update_deps(monkeypatch, tmp_path, _make_up_to_date_side_effect())
+    update_cmd._write_fleet_restart_pending_marker(expected_sha="def456")
+
+    written_before_restart = {"receipt_exists": None}
+
+    def _restart_that_kills_self():
+        # Simulate the real failure: by the time systemctl's restart call
+        # returns (or the process is SIGTERM'd), check whether a receipt
+        # was already durably written.
+        receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+        matches = list(receipt_dir.glob("update_*.json")) if receipt_dir.exists() else []
+        written_before_restart["receipt_exists"] = bool(matches)
+        return True
+
+    monkeypatch.setattr(update_cmd, "_run_pending_fleet_restart", _restart_that_kills_self)
+
+    hermes_main.cmd_update(args)
+
+    assert written_before_restart["receipt_exists"] is True, (
+        "the update receipt must be written to disk BEFORE the fleet-restart "
+        "catch-up runs, so a self-inflicted SIGTERM during systemctl restart "
+        "cannot orphan an in-flight receipt with no closing record"
+    )
