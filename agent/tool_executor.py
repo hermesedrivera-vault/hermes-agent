@@ -221,6 +221,13 @@ def _flush_session_db_after_tool_progress(
     Flush the already-appended assistant/tool messages immediately so the
     transcript survives destructive-but-valid tool calls.
     """
+    from agent.conversation_loop import _maybe_inject_run_budget_wrapup
+    from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
+
+    # Persist exactly the checkpoint text the next model call will see, before stamping
+    # this tool result as durable. Already-written rows must never be rewritten later.
+    _maybe_inject_run_budget_wrapup(agent, messages)
+    _maybe_inject_iteration_budget_warning(agent, messages)
     try:
         persisted = agent._flush_messages_to_session_db(messages) is not False
         if not persisted:
