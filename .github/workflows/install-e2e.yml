@@ -68,6 +68,13 @@ jobs:
       # -- they are the whole input, and the default shallow checkout has none.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # fetch-tags alone is not enough: actions/checkout still applies its
+          # default shallow depth (1), so a tag can be fetched as a ref without
+          # its target commit being reachable, and `git tag --list` sees
+          # nothing. fetch-depth: 0 forces a full history fetch so every tag's
+          # commit is actually present (2026-09-09 CI failure: "no release
+          # tags found" on a checkout that had fetch-tags: true).
+          fetch-depth: 0
           filter: blob:none
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
