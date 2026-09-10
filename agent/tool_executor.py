@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 from pathlib import Path
 import logging
@@ -421,11 +422,62 @@ def _tool_search_scoped_names(agent) -> frozenset:
         names = _ts.scoped_deferrable_names(scoped_defs)
     except Exception:
         names = frozenset()
-    try:
+    with contextlib.suppress(Exception):
         agent._tool_search_scope_cache = (cache_key, names)
+    return names
+
+
+def _canonical_tool_name(function_name: str) -> str:
+    """Map legacy tool-name aliases BEFORE agent-loop dispatch."""
+    from model_tools import _LEGACY_TOOL_ALIASES as _lta
+
+    return _lta.get(function_name, function_name)
+
+
+def _unwrap_tool_search_call(
+    agent, function_name: str, function_args: dict, *, flatten_probe: bool = False
+) -> tuple[str, dict, Optional[str]]:
+    """Peel the ``tool_call`` bridge so downstream hooks (checkpointing, guardrails, plugin
+    hooks, activity feed) see the underlying tool; ``tool_call.function`` stays untouched for
+    the transcript and tool_call_id pairing.
+
+    The unwrap bypasses handle_function_call's scope check, so session toolset scope is
+    enforced HERE. Returns ``(name, args, scope_block)``; ``scope_block`` is the block
+    message when the underlying tool is out of scope or its args fail the deferred-schema
+    probe (``flatten_probe`` collapses the probe's JSON payload to one plain string for
+    callers that wrap the message in ``{"error": ...}``).
+    """
+    scope_block: Optional[str] = None
+    try:
+        from tools import tool_search as _ts
+        if function_name != _ts.TOOL_CALL_NAME:
+            return function_name, function_args, None
+        underlying, underlying_args, err = _ts.resolve_underlying_call(function_args)
+        if err or not underlying:
+            return function_name, function_args, None
+        if underlying == _ts.CONNECTOR_BATCH_SENTINEL:
+            # Both executors retain the wrapper: scope/probe/hooks run per entry
+            # in the batch dispatcher, not against a synthetic registry name.
+            return function_name, function_args, None
+        if underlying not in _tool_search_scoped_names(agent):
+            return function_name, function_args, (
+                f"'{underlying}' is not available in this session. Use tool_search to find tools you can call."
+            )
+        # Validate before unwrapping: the generic bridge hides the concrete
+        # parameter schema from provider-native tool-call validation.
+        scope_block = _ts.validate_deferred_call_args(underlying, underlying_args)
+        if scope_block is None:
+            return underlying, underlying_args, None
+        if flatten_probe:
+            probe = json.loads(scope_block)
+            scope_block = (
+                f"{probe.get('error', '')} Parameters schema: "
+                f"{json.dumps(probe.get('parameters', {}), ensure_ascii=False)}. "
+                f"{probe.get('hint', '')}"
+            ).strip()
     except Exception:
         pass
-    return names
+    return function_name, function_args, scope_block
 
 
 @dataclass
