@@ -1940,6 +1940,34 @@ def _apply_pulled_update(
         node_failures=node_failures, desktop_build_ok=desktop_build_ok,
         pre_update_version=opts.pre_update_version)
 
+    # Hard gate: a platform_toolsets entry referencing a nonexistent toolset, or a declared
+    # dependency missing from the active environment, must block the fleet restart — not just
+    # print a warning that scrolls past. The pre-pull rollback tag (_create_pre_reset_safety_tag,
+    # taken before this checkout was touched) is left completely alone here: a preflight
+    # failure means "do not restart onto this code", not "undo the pull". See the 2026-09-10
+    # stale-toolset reconciliation postmortem this gate exists to prevent recurring.
+    from hermes_cli.update_preflight_validation import run_update_preflight_gate
+    _preflight = run_update_preflight_gate()
+    if not _preflight.ok:
+        print()
+        print("✗ Update preflight failed — the gateway fleet will NOT be restarted.")
+        if _preflight.toolset_warnings:
+            print("  Stale/invalid platform_toolsets entries:")
+            for w in _preflight.toolset_warnings:
+                print(f"    • {w}")
+        if _preflight.dependency_failures:
+            print("  Missing or inconsistent Python dependencies:")
+            for d in _preflight.dependency_failures:
+                print(f"    • {d}")
+        print(
+            "  Code was pulled and is on disk, but the running gateway(s) were left "
+            "on the PREVIOUS code — nothing was restarted, nothing was pushed. "
+            "Fix the configuration/dependency issue above, then run `hermes update` "
+            "again to retry the restart.")
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
+        sys.exit(1)
+
     # Exit code *before* the restart: under --gateway this process lives in the gateway's
     # systemd cgroup and the systemctl-restart fallback SIGKILLs it (KillMode=mixed), so
     # the marker would never land and the new gateway's watcher would time out spuriously.
