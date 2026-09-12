@@ -4241,10 +4241,11 @@ def detect_outbound_comm(text):
     """Detect an outbound EXTERNAL email/SMS send signal in free text.
 
     Content-based detector: catches an email/SMS send regardless of which
-    tool (terminal, execute_code, send_message) carries the text. Ported
-    from agent/provenance/approval_gate.py's detect_outbound_comm (that
-    module's version is unwired/unused in production; this is the wired
-    copy). Returns {"channel": "email"|"sms", "recipients": [...]}, or None.
+    tool (terminal, execute_code, send_message) carries the text. Originally
+    ported from agent/provenance/approval_gate.py's detect_outbound_comm;
+    that module was dead code (never wired into production) and was removed
+    in commit ea5108c9a8. This is the only surviving, wired copy.
+    Returns {"channel": "email"|"sms", "recipients": [...]}, or None.
     """
     if not text:
         return None
