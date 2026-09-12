@@ -208,3 +208,172 @@ class TestYoloMode:
         approval_module.clear_session("session-a")
 
         assert is_session_yolo_enabled("session-a") is False
+
+
+class TestYoloBypassAudit:
+    """A YOLO-caused bypass must emit an observable log event — see
+    tools.approval._audit_yolo_bypass(). The event must never carry
+    command/secret content, must never fire for a non-YOLO approval or
+    denial, and audit-emission failure must never affect the approval
+    decision itself.
+    """
+
+    DUMMY_SECRET = "DUMMY_SECRET_VALUE_1234"
+
+    def test_yolo_bypass_emits_audit_event(self, monkeypatch, caplog):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+
+        assert result["approved"] is True
+        assert any("approval.yolo_bypass" in rec.message for rec in caplog.records)
+
+    def test_normal_approved_command_does_not_emit_yolo_audit_event(self, monkeypatch, caplog):
+        """A command that isn't even flagged dangerous (so it's approved with
+        no YOLO involved at all) must not emit the YOLO bypass event."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_dangerous_command("echo hello", "local")
+
+        assert result["approved"] is True
+        assert not any("approval.yolo_bypass" in rec.message for rec in caplog.records)
+
+    def test_normal_approved_via_human_callback_does_not_emit_yolo_audit_event(self, monkeypatch, caplog):
+        """A genuinely dangerous command that goes through the normal
+        (non-YOLO) human-approval flow and is explicitly approved by that
+        human must not emit the YOLO bypass event — approval, YOLO bypass,
+        and denial are three distinct outcomes and only the middle one is
+        audited here."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "test-session")
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_dangerous_command(
+                "rm -rf /tmp/stuff", "local", approval_callback=lambda *a, **kw: "approve",
+            )
+
+        assert result["approved"] is True
+        assert not any("approval.yolo_bypass" in rec.message for rec in caplog.records)
+
+    def test_denied_command_does_not_emit_yolo_audit_event(self, monkeypatch, caplog):
+        """A hardline/user-deny block with no YOLO active must not emit the
+        YOLO bypass event — only an actual YOLO-caused bypass should."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "test-session")
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_dangerous_command(
+                "rm -rf /tmp/stuff", "local", approval_callback=lambda *a: "deny",
+            )
+
+        assert result["approved"] is False
+        assert not any("approval.yolo_bypass" in rec.message for rec in caplog.records)
+
+    def test_approvals_mode_off_alone_does_not_emit_yolo_audit_event(self, monkeypatch, caplog):
+        """approvals.mode == 'off' is a separate, config-driven bypass — it
+        must not be mislabeled as a YOLO bypass when YOLO itself is inactive."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        def _fake_mode():
+            return "off"
+
+        monkeypatch.setattr(approval_module, "_get_approval_mode", _fake_mode)
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+
+        assert result["approved"] is True
+        assert not any("approval.yolo_bypass" in rec.message for rec in caplog.records)
+
+    def test_yolo_audit_event_contains_no_command_text(self, monkeypatch, caplog):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        marker_command = f"echo {self.DUMMY_SECRET}"
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            check_dangerous_command(marker_command, "local")
+
+        yolo_records = [rec.message for rec in caplog.records if "approval.yolo_bypass" in rec.message]
+        assert yolo_records, "expected a yolo_bypass audit record"
+        for message in yolo_records:
+            assert marker_command not in message
+            assert self.DUMMY_SECRET not in message
+            assert "echo" not in message
+
+    def test_yolo_audit_event_includes_session_identity_when_available(self, monkeypatch, caplog):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "is_current_session_yolo_enabled", lambda: True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+
+        assert result["approved"] is True
+        yolo_records = [rec.message for rec in caplog.records if "approval.yolo_bypass" in rec.message]
+        assert yolo_records
+        assert any("session-a" in message for message in yolo_records)
+
+    def test_audit_emission_failure_does_not_affect_approval_decision(self, monkeypatch):
+        """If the audit helper itself raises, execution must proceed exactly as
+        if the audit call had succeeded — a logging problem must never turn
+        an approved command into a broken one."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated logging failure")
+
+        # Patch the logger call the helper uses, not the helper itself, so we
+        # exercise the helper's own internal try/except rather than bypassing it.
+        monkeypatch.setattr(approval_module.logger, "warning", _boom)
+
+        result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+        assert result["approved"] is True
+        assert result["message"] is None
+
+    def test_session_scoped_yolo_still_bypasses_and_now_also_audits(self, monkeypatch, caplog):
+        """Human-controlled session YOLO behavior is unchanged: it still causes
+        a bypass, and it now ALSO produces the audit event — both true at once."""
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "is_current_session_yolo_enabled", lambda: True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        token = set_current_session_key("session-a")
+        try:
+            with caplog.at_level("WARNING", logger="tools.approval"):
+                approved = check_all_command_guards("rm -rf /tmp/stuff", "local")
+        finally:
+            reset_current_session_key(token)
+
+        assert approved["approved"] is True
+        assert any("approval.yolo_bypass" in rec.message for rec in caplog.records)
+
+    def test_yolo_audit_fires_without_crashing_when_session_context_unavailable(self, monkeypatch, caplog):
+        """When no session/context identifier is available at all (env unset,
+        contextvars empty), the audit event must still fire without raising
+        and without crashing the approval path — it degrades to a placeholder
+        identity rather than failing."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+
+        with caplog.at_level("WARNING", logger="tools.approval"):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+
+        assert result["approved"] is True
+        yolo_records = [rec.message for rec in caplog.records if "approval.yolo_bypass" in rec.message]
+        assert yolo_records, "audit event must still fire with no session context available"
+        # Degrades to a placeholder rather than raising or omitting the field.
+        assert any("session=" in message for message in yolo_records)

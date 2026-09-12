@@ -3509,6 +3509,25 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
+def _audit_yolo_bypass(check_site: str) -> None:
+    """Log an observable event when YOLO (frozen process-scoped or human-enabled
+    session-scoped) specifically caused an approval bypass — not when only
+    ``approvals.mode: off`` did, which is a separate, config-driven bypass with
+    no YOLO involvement. Callers pass the checking function's name as
+    ``check_site`` so the event says which guard was bypassed.
+
+    Never logs command/code contents, secrets, or environment values — category,
+    check site, and session identity only. Failure here must never affect the
+    approval decision: every exception is swallowed so a logging problem can
+    never turn an approved command into an unhandled error.
+    """
+    try:
+        session_id = _approval_session_id.get() or get_current_session_key(default="") or "<none>"
+        logger.warning("approval.yolo_bypass: session=%s check=%s", session_id, check_site)
+    except Exception:  # noqa: BLE001 - audit emission must never break execution
+        pass
+
+
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Return whether one exact session bypasses Hermes approval prompts.
 
@@ -3881,6 +3900,7 @@ def _run_approval_gate(
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        _audit_yolo_bypass("_run_approval_gate")
         return {"approved": True, "message": None}
 
     # Step 34 (Design B, closes the Step 33 finding): a pre-existing
@@ -5125,6 +5145,7 @@ def check_dangerous_command(command: str, env_type: str,
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        _audit_yolo_bypass("check_dangerous_command")
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -5774,7 +5795,10 @@ def check_all_command_guards(command: str, env_type: str,
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    _yolo_active = _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    if _yolo_active:
+        _audit_yolo_bypass("check_all_command_guards")
+    if _yolo_active or approval_mode == "off":
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -6509,7 +6533,10 @@ def check_execute_code_guard(code: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    _yolo_active = _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    if _yolo_active:
+        _audit_yolo_bypass("check_execute_code_guard")
+    if _yolo_active or approval_mode == "off":
         return {"approved": True, "message": None}
 
     # Outbound-communication content check: runs before the whole-script
