@@ -74,6 +74,42 @@ def _home_and_resolved(path: str) -> tuple[str, str]:
     return tuple(os.path.realpath(os.path.expanduser(p)) for p in ("~", str(path)))
 
 
+def _hermes_source_root() -> Optional[Path]:
+    """Resolved root of the Hermes source checkout (parent of ``agent/``), or ``None``
+    on failure. Tests monkeypatch this name to point at a throwaway tree."""
+    with suppress(Exception):
+        return Path(__file__).resolve().parent.parent
+    return None
+
+
+# Repo-relative source files that directly implement Hermes's authorization/
+# security boundaries. A prompt-injected or self-modifying agent editing any of
+# these could weaken or disable the write/approval/provenance gates themselves —
+# these get the same hard, YOLO-immune deny as credential files, not merely the
+# routine approval gate other source files fall under.
+_HERMES_PROTECTED_SOURCE_FILES = (
+    os.path.join("tools", "approval.py"),
+    os.path.join("tools", "approval_detection.py"),
+    os.path.join("tools", "file_tools_write_guards.py"),
+    os.path.join("agent", "file_safety.py"),
+    os.path.join("agent", "provenance", "gate.py"),
+    os.path.join("agent", "provenance", "store.py"),
+    os.path.join("hermes_cli", "config.py"),
+    os.path.join("gateway", "run.py"),
+    os.path.join("gateway", "config.py"),
+)
+
+
+def build_protected_source_paths() -> set[str]:
+    """Return resolved absolute paths of Hermes's own security-critical source files
+    (see ``_HERMES_PROTECTED_SOURCE_FILES``), or an empty set if the source root
+    can't be resolved (e.g. a packaged/frozen install with no on-disk checkout)."""
+    root = _hermes_source_root()
+    if root is None:
+        return set()
+    return {os.path.realpath(str(root / rel)) for rel in _HERMES_PROTECTED_SOURCE_FILES}
+
+
 def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     # ``~/.ssh/config`` is deliberately NOT hard-denied: no key bytes, and editing
@@ -93,7 +129,7 @@ def build_write_denied_paths(home: str) -> set[str]:
         *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
-    return {os.path.realpath(p) for p in paths}
+    return {os.path.realpath(p) for p in paths} | build_protected_source_paths()
 
 
 def build_write_denied_prefixes(home: str) -> list[str]:
