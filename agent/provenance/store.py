@@ -116,6 +116,14 @@ class EvidenceStore:
                 details TEXT
             )
         """)
+        # Additive seed toward one shared evidence/event model (Control
+        # Plane Commit 5), sourced from the existing audit_log rather than a
+        # new table. Nullable, no default: existing rows have no meaningful
+        # category to backfill, and NULL ("unknown/unclassified") is a
+        # truthful state, not a fabricated one. No existing emitter is
+        # required to set it -- this column adds a capability, it does not
+        # change any current writer's or reader's behavior.
+        self._ensure_column("audit_log", "kind", "TEXT")
         self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp 
             ON audit_log(timestamp DESC)
@@ -425,6 +433,7 @@ class EvidenceStore:
         mode: str = "shadow",
         blocked: bool = False,
         details: Optional[str] = None,
+        kind: Optional[str] = None,
     ):
         """
         IMMUTABLE AUDIT LOG - agent cannot write here.
@@ -434,10 +443,10 @@ class EvidenceStore:
         """
         self.db.execute(
             """
-            INSERT INTO audit_log (timestamp, event, tool, reason, mode, session_id, blocked, details)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audit_log (timestamp, event, tool, reason, mode, session_id, blocked, details, kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (time.time(), event, tool, reason, mode, session_id, blocked, details),
+            (time.time(), event, tool, reason, mode, session_id, blocked, details, kind),
         )
         self.db.commit()
 
