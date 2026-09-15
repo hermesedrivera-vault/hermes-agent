@@ -284,7 +284,7 @@ class TestYoloBypassAudit:
         def _fake_mode():
             return "off"
 
-        monkeypatch.setattr(approval_module, "_get_approval_mode", _fake_mode)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", _fake_mode)
 
         with caplog.at_level("WARNING", logger="tools.approval"):
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
@@ -309,7 +309,7 @@ class TestYoloBypassAudit:
 
     def test_yolo_audit_event_includes_session_identity_when_available(self, monkeypatch, caplog):
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
         monkeypatch.setattr(approval_module, "is_current_session_yolo_enabled", lambda: True)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
@@ -345,7 +345,7 @@ class TestYoloBypassAudit:
         a bypass, and it now ALSO produces the audit event — both true at once."""
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
         monkeypatch.setattr(approval_module, "is_current_session_yolo_enabled", lambda: True)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 

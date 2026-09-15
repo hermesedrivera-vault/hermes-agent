@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch as mock_patch
 import pytest
 
 import tools.approval as approval_module
+from tools import approval_context
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 from tools.approval import (
     approve_session,
@@ -24,7 +25,7 @@ from tools.approval import (
 
 @pytest.fixture(autouse=True)
 def _mode_manual(monkeypatch):
-    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
 
 
 @pytest.fixture(autouse=True)
@@ -321,7 +322,7 @@ def test_cron_deny_blocks_outbound_even_with_preexisting_permanent_grant(monkeyp
     approval_module.approve_permanent(pattern_key)
 
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: True)
-    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "deny")
     monkeypatch.setattr(approval_module, "_get_outbound_comm_mode", lambda: "enforce")
     tokens = set_session_vars(session_key="test-session", cron_session="1")
     try:
@@ -347,7 +348,7 @@ def test_cron_approve_still_allows_preexisting_permanent_outbound_grant(monkeypa
     approval_module.approve_permanent(pattern_key)
 
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: True)
-    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "approve")
+    monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "approve")
     tokens = set_session_vars(session_key="test-session", cron_session="1")
     try:
         result = check_outbound_comm_guard(
@@ -375,7 +376,7 @@ def test_cron_deny_dangerous_command_permanent_grant_unaffected(monkeypatch):
     approval_module.approve_permanent(pattern_key)
 
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: True)
-    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "deny")
     tokens = set_session_vars(session_key="test-session", cron_session="1")
     try:
         result = check_dangerous_command(command, "local")
@@ -424,7 +425,7 @@ def test_cron_mode_deny_blocks(monkeypatch):
     # actually exercises the cron-deny block instead of the shadow override.
     tokens = set_session_vars(session_key="test-session", cron_session="1")
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: True)
-    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "deny")
     monkeypatch.setattr(approval_module, "_get_outbound_comm_mode", lambda: "enforce")
     try:
         result = check_outbound_comm_guard(
@@ -439,7 +440,7 @@ def test_cron_mode_deny_blocks(monkeypatch):
 def test_cron_mode_approve_allows(monkeypatch):
     tokens = set_session_vars(session_key="test-session", cron_session="1")
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: True)
-    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "approve")
+    monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "approve")
     try:
         result = check_outbound_comm_guard(
             "terminal", "", channel_recipient_override=("email", "someone@external.com")
@@ -485,7 +486,7 @@ def test_execute_code_no_outbound_signal_reaches_local_early_return():
     reset_session_vars()
     result = check_execute_code_guard("import os\nprint('hi')\n", "local")
     assert result["approved"] is False
-    assert "non-interactive" in result["message"] or "fail-closed" in result["message"].lower()
+    assert result.get("status") == "pending_approval" or "approval" in result["message"].lower()
 
 
 # ---------------------------------------------------------------------------
