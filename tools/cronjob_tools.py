@@ -632,11 +632,15 @@ def _action_create(a: Dict[str, Any]) -> str:
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
-            failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])))
+            failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+               if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
         return tool_error(_partial.pop("error"), success=False, **_partial)
-    _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.", _local_delivery_notice(job, deliver))))
+    _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
+        "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
+        _local_delivery_notice(job, deliver))))
     # The builtin ticker lives in the gateway process: with no gateway running the job is stored
     # but never fires — tell the model (the CLI already warns).
     _result = {
@@ -990,7 +994,9 @@ def cronjob(
     failure_deliver: Optional[Union[str, List[str]]] = None,
     all: Optional[bool] = None,
     task_id: str = None,
-    session_id: Optional[str] = None) -> str:
+    session_id: Optional[str] = None,
+    paused: bool = False,
+    paused_reason: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1117,6 +1123,8 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
+            "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
         },
         "required": ["action"]
     }
@@ -1124,13 +1132,17 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
 
 
 def check_cronjob_requirements() -> bool:
-    """Available in interactive CLI mode and gateway/messaging platforms (the scheduler is
-    internal; no crontab needed). Flags must be explicitly truthy via ``env_var_enabled``."""
-    from utils import env_var_enabled
+    """Available in interactive CLI mode, gateway/messaging platforms, and cron runs (the
+    scheduler is internal; no crontab needed). Flags must be explicitly truthy via
+    ``env_var_enabled``. An external cron worker has the presence vars stripped from its env, so
+    the cron session marker keeps ``cron.allow_agent_scheduling`` meaningful there."""
+    from gateway.session_context import get_session_env
+    from utils import env_var_enabled, is_truthy_value
     return (
         env_var_enabled("HERMES_INTERACTIVE")
         or env_var_enabled("HERMES_GATEWAY_SESSION")
         or env_var_enabled("HERMES_EXEC_ASK")
+        or is_truthy_value(get_session_env("HERMES_CRON_SESSION", ""))
     )
 
 
@@ -1155,6 +1167,7 @@ def _cronjob_handler(args, **kw):
         monitor_url=_mon_url,
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
+        paused=args.get("paused", False),
         **{key: args.get(key) for key in _HANDLER_FORWARDED_ARGS},
     )
 

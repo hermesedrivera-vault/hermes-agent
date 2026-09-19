@@ -23,7 +23,7 @@ from typing import Optional
 from utils import env_var_enabled, is_truthy_value
 from tools import approval_context
 from tools.approval_context import (
-    _get_session_platform, _is_cron_approval_context,
+    _get_approval_mode, _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
     _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
     _tirith_fail_open, get_current_session_key,
@@ -475,7 +475,7 @@ def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Canonical three-source bypass check: process ``--yolo`` (frozen at import), the
     session-scoped gateway ``/yolo`` toggle, ``approvals.mode: off``. Pure bypass
     sub-expression only — hardline blocklist / permanent allowlist are the caller's job."""
-    return (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or approval_context._get_approval_mode() == "off")
+    return (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or _get_approval_mode() == "off")
 
 
 def is_approval_bypass_active() -> bool:
@@ -928,7 +928,7 @@ def _run_approval_gate(
     if _yolo_active():
         _audit_yolo_bypass("_run_approval_gate")
         return _approved()
-    if approval_context._get_approval_mode() == "off":
+    if _get_approval_mode() == "off":
         return _approved()
 
     # Step 34 (Design B, closes the Step 33 finding): a pre-existing PERMANENT
@@ -1143,7 +1143,7 @@ def check_all_command_guards(command: str, env_type: str,
     if blocked is not None:
         return blocked
 
-    approval_mode = approval_context._get_approval_mode()
+    approval_mode = _get_approval_mode()
     if _yolo_active():
         _audit_yolo_bypass("check_all_command_guards")
         return _approved()
@@ -1237,7 +1237,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         return _approved()
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _approved()
-    approval_mode = approval_context._get_approval_mode()
+    approval_mode = _get_approval_mode()
     if _yolo_active():
         _audit_yolo_bypass("check_execute_code_guard")
         return _approved()
@@ -1274,7 +1274,43 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     # and messaging ask-mode drive whole-script approval); when that leaks into a CLI with no notify callback, the
     # engine falls through to the CLI Dangerous Command panel instead of a silent pending_approval.
     if not is_gateway and not is_ask:
-        return _approved()
+        if is_cli:
+            # CLI interactive: NOT the fail-open gap the 2026-08-29 fix
+            # targets. A human is present; this script's own terminal()
+            # calls are guarded per-call via propagated approval context
+            # (#33057). A whole-script prompt here would fire redundantly
+            # on every execute_code call, which is why CLI intentionally
+            # reaches this branch without a whole-script gate.
+            return _approved()
+        # No TTY, no gateway, no ask surface, and _unattended_contexts()
+        # above yielded nothing (not -q/cron/single-query either): a truly
+        # bare non-interactive execute_code call. Historically this
+        # auto-approved with zero logging (upstream's own #30882 scope
+        # choice) -- execute_code bypasses shell-string DANGEROUS_PATTERNS
+        # detection entirely (subprocess/os.system/ctypes), so that gap was
+        # closed 2026-08-29 (f730da0d08): fails CLOSED by default now.
+        logger.warning(
+            "AUTO-APPROVED execute_code script in non-interactive "
+            "non-gateway context (pattern: %s): %s -- no interactive "
+            "user/gateway/cron/single-query context present; BLOCKED "
+            "(fail-closed). Set approvals.execute_code_noninteractive_mode: "
+            "approve in config.yaml to restore auto-approve for this "
+            "specific known non-interactive execute_code workflow.",
+            pattern_key, description,
+        )
+        if _get_execute_code_noninteractive_mode() == "approve":
+            return _approved()
+        return _denied(
+            f"BLOCKED: {description} No interactive user, gateway, cron, or "
+            "single-query context is present to approve it. execute_code "
+            "runs arbitrary local Python that bypasses shell-command "
+            "pattern detection entirely, so this fails closed rather than "
+            "proceeding unattended. To allow this specific known "
+            "non-interactive workflow, set "
+            "approvals.execute_code_noninteractive_mode: approve in "
+            "config.yaml.",
+            pattern_key=pattern_key, description=description, outcome="blocked",
+        )
 
     session_key = get_current_session_key()
     # Built only past the early-return gates so common paths don't copy a potentially-large script into this string.
@@ -1539,6 +1575,134 @@ def check_outbound_comm_guard(tool_name, text_for_detection, channel_recipient_o
         }
 
 
+def _cron_deliver_target_set(deliver: Optional[str]) -> frozenset:
+    """Normalize a cron `deliver` string into a comparable set of tokens.
+
+    Splits on commas, lowercases, strips whitespace. Used to compare an
+    old vs. new deliver value for drift purposes -- token-set equality,
+    not string equality, so re-ordering ('origin,all' -> 'all,origin')
+    is not flagged as drift.
+    """
+    if not deliver:
+        return frozenset({"local"})
+    return frozenset(
+        p.strip().lower() for p in str(deliver).split(",") if p.strip()
+    ) or frozenset({"local"})
+
+
+def check_cron_deliver_change_guard(
+    job_id: Optional[str],
+    old_deliver: Optional[str],
+    new_deliver: Optional[str],
+    is_create: bool,
+) -> dict:
+    """Authorization gate for a cron job's delivery-target changing to an
+    external/explicit recipient the model was not already approved to
+    reach for THIS job.
+
+    Threat model (2026-09-06, weekly-honesty-scorecard opportunity #3):
+    cron jobs run fully unattended -- there is no live human approving each
+    fire, so gating every DELIVERY (like check_outbound_comm_guard does for
+    a live send_message call) would block every legitimate scheduled report
+    under approvals.cron_mode: deny. The actual threat is narrower: the
+    model silently redirecting an existing job's delivery target (or
+    creating a new job aimed) at an external/explicit platform:chat_id it
+    was never separately authorized to reach. Human approval happens ONCE,
+    at the point the deliver target is set/changed -- not on every
+    subsequent unattended fire to an already-approved target.
+
+    Safe (never gated): 'local' (no delivery at all), 'origin' (resolves to
+    the CURRENT chat -- the human already present when this tool call is
+    made), 'all' (every home channel the human already configured in
+    config.yaml -- not a model-chosen recipient), and bot-chat targets
+    (machine-local, validated separately by _validate_bot_chat_deliver).
+    Gated: any explicit 'platform:chat_id[:thread_id]' token that is NEW
+    relative to the job's previously-stored deliver value (create: any
+    explicit token; update: only tokens not already present).
+
+    Returns {"approved": bool, "message": str|None} -- same contract as
+    check_dangerous_command/check_mcp_call_guard.
+    """
+    try:
+        if new_deliver is None:
+            return {"approved": True, "message": None}
+
+        _SAFE_TOKENS = {"local", "origin", "all"}
+
+        def _is_gated_token(tok: str) -> bool:
+            t = tok.strip().lower()
+            if not t or t in _SAFE_TOKENS:
+                return False
+            if t.startswith("bot-chat"):
+                return False
+            # Anything else (platform:chat_id[:thread_id]) is an explicit,
+            # model-chosen recipient -- gated unless already-approved (see
+            # drift check below).
+            return True
+
+        new_tokens = _cron_deliver_target_set(new_deliver)
+        gated_new = {t for t in new_tokens if _is_gated_token(t)}
+        if not gated_new:
+            return {"approved": True, "message": None}
+
+        if not is_create:
+            old_tokens = _cron_deliver_target_set(old_deliver)
+            gated_new = gated_new - old_tokens
+            if not gated_new:
+                # Every explicit target was already present before this
+                # update -- no NEW recipient introduced, nothing to gate.
+                return {"approved": True, "message": None}
+
+        recipient_key = ",".join(sorted(gated_new))
+        job_label = job_id or "<new job>"
+        pattern_key = f"cron_deliver_change::{job_label}::{recipient_key}"
+        description = (
+            f"Cron job '{job_label}' {'creating' if is_create else 'changing'} "
+            f"its delivery target to include: {recipient_key}"
+        )
+
+        decision = _run_approval_gate(
+            pattern_key=pattern_key,
+            description=description,
+            display_target=recipient_key,
+            cron_deny_message=(
+                f"BLOCKED: cron job '{job_label}' delivery target change to "
+                f"'{recipient_key}' but cron jobs run without a user present "
+                "to approve it. Find an alternative approach. To allow this "
+                "in cron jobs, set approvals.cron_mode: approve in config.yaml."
+            ),
+            autoapprove_log_prefix=(
+                "AUTO-APPROVED cron delivery-target change in non-interactive "
+                "non-gateway context"
+            ),
+            fail_closed_when_no_human=True,
+            allow_permanent=False,
+            no_human_block_message=(
+                f"BLOCKED: cron job '{job_label}' delivery target change to "
+                f"'{recipient_key}' requires approval but no interactive user "
+                "or gateway is present to approve it. Change NOT applied."
+            ),
+            single_query_deny_message=(
+                f"BLOCKED: cron job '{job_label}' delivery target change to "
+                f"'{recipient_key}' but single-query mode (-q) runs without a "
+                "user present to approve it. Find an alternative approach. "
+                "To allow this in single-query mode, set "
+                "approvals.single_query_mode: approve in config.yaml."
+            ),
+        )
+        return decision
+    except Exception as exc:
+        logger.exception("check_cron_deliver_change_guard raised -- failing CLOSED")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: cron delivery-target authorization check failed "
+                f"with an internal error ({exc}). This is a fail-closed "
+                "default -- the delivery-target change was NOT applied."
+            ),
+        }
+
+
 # Load permanent allowlist from config on module import
 load_permanent_allowlist()
 
@@ -1558,6 +1722,235 @@ import tempfile  # noqa: F401,E402
 import time  # noqa: F401,E402
 import unicodedata  # noqa: F401,E402
 import uuid  # noqa: F401,E402
+
+
+def _get_cron_approval_mode() -> str:
+    """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        config = load_config_readonly()
+        mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "deny"
+    except Exception:
+        return "deny"
+
+
+def _get_single_query_approval_mode() -> str:
+    """Read the single-query (-q) approval mode from config. Returns 'deny' or 'approve'."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        config = load_config_readonly()
+        mode = str(cfg_get(config, "approvals", "single_query_mode", default="deny")).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "deny"
+    except Exception:
+        return "deny"
+
+
+def _get_execute_code_noninteractive_mode() -> str:
+    """Read the execute_code-specific non-interactive fallback mode from
+    config. Returns 'block' or 'approve'.
+
+    Deliberately a SEPARATE config key from
+    ``approvals.dangerous_command_noninteractive_mode`` (the shell-command
+    opt-in). execute_code runs arbitrary local Python -- subprocess, os.system,
+    ctypes, direct file/process APIs -- none of which pass through
+    ``detect_dangerous_command()``'s pattern matching at all, so this branch
+    has a materially higher risk profile than the shell-command fallback.
+    One authorization must not silently cover both; an operator who
+    intentionally trusts headless shell commands has NOT thereby also
+    authorized headless arbitrary-code execution.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        config = load_config_readonly()
+        mode = str(
+            cfg_get(
+                config, "approvals", "execute_code_noninteractive_mode",
+                default="block",
+            )
+        ).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "block"
+    except Exception:
+        return "block"
+
+
+# check_all_command_guards/check_execute_code_guard/check_outbound_comm_guard.
+# =========================================================================
+
+# Conservative allowlist of argument-key names that may be treated as a
+# stable resource/target identifier for approval binding. Deliberately
+# narrow and literal: no semantic inference, no assumption that "path"
+# always means a destructive filesystem target, no reliance on tool
+# descriptions. If a call's arguments contain exactly one of these keys
+# with a non-empty scalar value, that becomes the binding target; anything
+# else falls back to a non-cacheable per-call approval (see
+# check_mcp_call_guard docstring).
+_MCP_TARGET_ARG_KEYS = (
+    "target", "resource", "resource_id", "id",
+    "path", "file_path", "filepath",
+    "url", "uri",
+    "recipient", "to",
+)
+
+
+def _extract_mcp_target(tool_args: dict) -> Optional[str]:
+    """Best-effort, deliberately conservative resource/target extraction.
+
+    Returns a normalized string when exactly one recognized target-shaped
+    key is present in ``tool_args`` with a non-empty scalar value, else
+    None. This is NOT a semantic safety judgment -- it only answers "is
+    there something stable enough to bind an approval to so a later call
+    with a DIFFERENT value doesn't silently reuse this one's approval."
+    Model-generated argument content is never treated as proof an action
+    is safe; it is only ever used as a binding key. Multiple candidate
+    keys are treated as ambiguous and fail closed to no-target rather than
+    guessing which one is authoritative.
+    """
+    if not isinstance(tool_args, dict):
+        return None
+    found = []
+    for key in _MCP_TARGET_ARG_KEYS:
+        if key in tool_args:
+            value = tool_args[key]
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                found.append((key, str(value).strip()))
+    if len(found) != 1:
+        return None
+    key, value = found[0]
+    return f"{key}={value}"
+
+
+def check_mcp_call_guard(
+    server_name: str,
+    tool_name: str,
+    tool_args: dict,
+) -> dict:
+    """Canonical authorization gate for write-capable MCP tool calls on
+    servers configured ``trust: untrusted`` (readOnlyHint=True tools and
+    trust=full servers never reach this function -- see
+    tools/mcp_tool.py's _trust_gate_check, which is unmodified except for
+    its call target in this one branch).
+
+    Reuses the existing decision core (_run_approval_gate) and identity
+    function (get_current_authorization_key) exactly as
+    check_outbound_comm_guard/check_execute_code_guard do. Does NOT reuse
+    check_outbound_comm_guard's (channel, recipient) data model -- per the
+    Step 51 design report, an arbitrary MCP side effect (file write, cloud
+    delete, SaaS setting change, financial transaction, ...) frequently has
+    no communication-endpoint-shaped recipient, and forcing one through
+    recipient normalization would either fail closed uninformatively or
+    silently pass through the guard's comms-specific passthrough branch
+    with no real target-binding value.
+
+    Approval binding:
+      - When a stable target IS extracted (see _extract_mcp_target):
+        pattern_key = "mcp_action::{server}::{tool}::{target}" -- may be
+        reused by a LATER call with the identical
+        server+tool+target+session+task+subagent, per ordinary
+        _run_approval_gate/is_approved session-cache semantics.
+      - When NO stable target is extracted: pattern_key includes a random
+        per-call nonce, guaranteeing this decision is never looked up nor
+        stored for reuse by any other call, however identical the rest of
+        the call looks. Every invocation without an extractable target
+        requires fresh approval.
+
+    Identity: get_current_authorization_key() (session+task+subagent
+    composite) -- NEVER get_current_session_key(). A different task_id or
+    subagent_id within the same session is treated as a different
+    identity and cannot reuse another identity's approval.
+
+    Permanent ("always") approval is explicitly disabled
+    (allow_permanent=False) -- MCP side-effect approvals are session-scoped
+    at maximum, matching the existing outbound_external_comm precedent.
+
+    Cron: participates directly in the canonical cron_mode branch inside
+    _run_approval_gate (fail_closed_when_no_human=True, cron_deny_message
+    below) -- a cron job under cron_mode: deny is blocked immediately with
+    no interactive prompt and no timeout-dependent behavior. This function
+    never calls request_elicitation_consent()'s CLI/TUI fallback.
+
+    Fail-closed: any exception, missing/invalid authorization identity, or
+    inability to construct a pattern_key results in denial, never approval.
+
+    Returns {"approved": bool, "message": str|None, ...} -- same contract
+    as the other three canonical guards.
+    """
+    try:
+        session_key = get_current_authorization_key()
+        if not session_key or session_key == "default":
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: MCP tool call authorization requires a known "
+                    "session identity. No session identity was found; "
+                    f"'{tool_name}' on server '{server_name}' was NOT run."
+                ),
+            }
+
+        target = _extract_mcp_target(tool_args if isinstance(tool_args, dict) else {})
+        if target is not None:
+            pattern_key = f"mcp_action::{server_name}::{tool_name}::{target}"
+            display_target = f"{server_name}.{tool_name}({target})"
+        else:
+            # No confidently identifiable target: never cacheable. A random
+            # nonce guarantees this pattern_key can never collide with (and
+            # therefore never be satisfied by) any prior or future call,
+            # however similar the rest of the call looks.
+            nonce = os.urandom(8).hex()
+            pattern_key = f"mcp_action::{server_name}::{tool_name}::__no_target__::{nonce}"
+            display_target = f"{server_name}.{tool_name}(<no stable target>)"
+
+        description = (
+            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            "wants to run (write-capable; no readOnlyHint=true annotation)"
+        )
+
+        decision = _run_approval_gate(
+            pattern_key=pattern_key,
+            description=description,
+            display_target=display_target,
+            cron_deny_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but cron jobs run "
+                "without a user present to approve it. Find an alternative "
+                "approach that avoids this call. To allow untrusted MCP "
+                "write-capable calls in cron jobs, set "
+                "approvals.cron_mode: approve in config.yaml."
+            ),
+            autoapprove_log_prefix="AUTO-APPROVED MCP call in non-interactive non-gateway context",
+            fail_closed_when_no_human=True,
+            allow_permanent=False,
+            no_human_block_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but no interactive user "
+                "or gateway is present to approve it. The call was NOT run."
+            ),
+            single_query_deny_message=(
+                f"BLOCKED: MCP tool '{tool_name}' on untrusted server "
+                f"'{server_name}' requires approval but single-query mode "
+                "(-q) runs without a user present to approve it. Find an "
+                "alternative approach that avoids this call. To allow "
+                "untrusted MCP write-capable calls in single-query mode, set "
+                "approvals.single_query_mode: approve in config.yaml."
+            ),
+        )
+        return decision
+    except Exception as exc:
+        logger.exception("check_mcp_call_guard raised -- failing CLOSED")
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: MCP call authorization check failed with an "
+                f"internal error ({exc}). This is a fail-closed default -- "
+                f"'{tool_name}' on server '{server_name}' was NOT run."
+            ),
+        }
 
 
 _PLUGIN_COMPAT_LAZY = {
