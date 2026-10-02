@@ -74,9 +74,16 @@ on:
 permissions:
   contents: read
 
+# A scheduled run that is still mid-flight when the next 12-hour trigger fires
+# used to get killed by its own successor (same ref-scoped group, collapse
+# always on) — "Pick release tags" cancelled 4 min into checkout on a run
+# that had done nothing wrong, downstream steps then failed on a missing
+# upstream output. github.run_id scopes schedule/dispatch runs to themselves
+# (never collapsed); only genuinely duplicate pushes to the same ref still
+# collapse via cancel-in-progress.
 concurrency:
-  group: install-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: install-e2e-${{ github.event_name == 'schedule' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   # Which released versions do we test updating FROM? Resolved once,
