@@ -49,18 +49,42 @@ def register_vault_redaction_value(value) -> None:
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
     it to (CR/LF stripped), since that is what the page holds.
+
+    Cycle 3 (2026-10-31): also registers hex and base64 (standard + urlsafe, with and without
+    padding) encodings of values >= 16 chars. Exact-substring matching (redact_registered_
+    vault_values) cannot catch a secret that was transcoded -- `base64 .env` / `xxd .env` output
+    never contains the literal secret string as a substring, only its encoded bytes. This closes
+    that gap the same way the rest of this registry works: register the value the output will
+    actually contain, don't add a new redaction pipeline. The length floor avoids flooding the
+    bucket with encodings of short, false-positive-prone values.
     """
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
+        candidates = [value, normalized]
+        if len(value) >= 16:
+            import base64 as _b64
+            raw = value.encode("utf-8", errors="ignore")
+            try:
+                # hex is byte-position-independent (1 byte -> 2 hex chars, no cross-byte
+                # dependency), so a single literal registration reliably catches `xxd`/`od -A x`
+                # output regardless of where the secret sits in the source file.
+                candidates.append(raw.hex())
+            except Exception:
+                pass
+            # base64 is NOT position-independent (3-byte -> 4-char blocks depend on the byte
+            # offset mod 3), so no fixed literal substring reliably matches `base64` output at
+            # every possible alignment. That case is instead handled by a decode-and-check scan
+            # (_redact_base64_encoded_secrets, below) run from redact_registered_vault_values.
+        for v in candidates:
             if v:
                 bucket.pop(v, None)  # re-registering refreshes recency
                 bucket[v] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+
 
 
 def clear_vault_redaction_values() -> None:
@@ -135,7 +159,40 @@ def redact_registered_vault_values(text: str) -> str:
     for value in values:
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
+    if values:
+        text = _redact_base64_encoded_secrets(text, values)
     return text
+
+
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{20,}={0,2}")
+
+
+def _redact_base64_encoded_secrets(text: str, known_values) -> str:
+    """Catch a registered secret transcoded through `base64`/`openssl base64`, which the literal
+    substring scrub above cannot: base64 groups bytes in 3s, so a secret's own encoding only
+    reproduces as a clean substring of the whole-file encoding 1 time in 3 (byte offset mod 3).
+    Decode-and-check instead of trying to pre-register every alignment: scan for base64-looking
+    runs, decode each, and if the decoded bytes contain a known secret value, mask the whole run.
+    """
+    import base64 as _b64
+    known_bytes = [v.encode("utf-8", errors="ignore") for v in known_values if len(v) >= 16]
+    if not known_bytes:
+        return text
+
+    def _try_mask(m: re.Match) -> str:
+        token = m.group(0)
+        for variant in (token, token.replace("-", "+").replace("_", "/")):
+            padded = variant + "=" * (-len(variant) % 4)
+            try:
+                decoded = _b64.b64decode(padded, validate=False)
+            except Exception:
+                continue
+            if any(kb in decoded for kb in known_bytes):
+                return "«redacted-vault-secret-b64»"
+        return token
+
+    return _BASE64_RUN_RE.sub(_try_mask, text)
+
 
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
