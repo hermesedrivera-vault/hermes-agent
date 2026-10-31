@@ -8,6 +8,7 @@ clear denial for models that respect tool errors plus a visible audit trail.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from contextlib import suppress
 from typing import Optional
@@ -340,6 +341,24 @@ _DID_SUFFIX = (
     " (Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
 )
 
+# Cycle 3 (2026-10-31): generic basename patterns, ANYWHERE on disk, for every profile
+# including default -- same treatment as the .env "anywhere on disk" check above. Narrow
+# on purpose: "secret" must appear as its own word-ish token (not "secretary.txt"), and
+# the token pattern requires a literal ".json" extension so "token_bucket.py" (a rate
+# limiter, not a credential) is not falsely blocked. False negatives (a secret file named
+# something unrelated) are expected -- this is a basename heuristic, not a content scan.
+_GENERIC_SECRET_BASENAME_RE = re.compile(r"(?:^|[._-])secret(?:s)?(?:[._-]|$)", re.IGNORECASE)
+_GENERIC_TOKEN_JSON_RE = re.compile(r"(?:^|[._-])token(?:s)?[._-].*\.json$", re.IGNORECASE)
+
+
+def _looks_like_generic_secret_basename(name: str) -> bool:
+    """True for a filename shaped like *secret* or *token*.json, independent of
+    directory -- the config-key-name counterpart to ``_key_has_secret_keyword``."""
+    lowered = name.lower()
+    if lowered in {".env.example", ".env.sample", ".env.template", ".env.dist"}:
+        return False
+    return bool(_GENERIC_SECRET_BASENAME_RE.search(lowered) or _GENERIC_TOKEN_JSON_RE.search(lowered))
+
 # Exact-file credential stores under HERMES_HOME / <root>. The agent never
 # needs these directly — provider tools consume them through internal channels.
 # bws_cache.json is the Bitwarden Secrets Manager disk cache: plaintext secret values.
@@ -410,6 +429,11 @@ def get_read_block_error(path: str) -> Optional[str]:
             reason = (
                 "is a secret-bearing environment file and cannot be read to prevent credential "
                 "leakage. If you need to check the file structure, read .env.example instead." + _DID_SUFFIX
+            )
+        if reason is None and _looks_like_generic_secret_basename(resolved.name):
+            reason = (
+                "matches a credential-file naming pattern (*secret*, *token*.json) and cannot be "
+                "read directly to prevent credential leakage, anywhere on disk, for every profile." + _DID_SUFFIX
             )
     return f"Access denied: {path} {reason}" if reason else None
 
