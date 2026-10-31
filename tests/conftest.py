@@ -449,6 +449,24 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
+def _reset_redact_module_caches():
+    """agent/redact.py keeps two module-level caches that are NOT reset by monkeypatch's env
+    teardown: ``_REDACT_ENABLED_BY_HOME`` (per-home on/off memoization) and
+    ``_VAULT_REDACTION_VALUES`` (registered secret values for exact/derived-encoding scrubbing).
+    A test that sets HERMES_REDACT_SECRETS=false via monkeypatch + a HERMES_HOME override leaves
+    a stale ``False`` cached for that home_key forever, silently disabling redaction for every
+    later test that happens to resolve the same home_key (cycle3 2026-10-31: this made
+    tests/security/test_cycle3_secrets_deny_rule.py order-dependent on tests/tools/test_approval.py
+    running first). Reset both before AND after so a test's own setup is also hermetic."""
+    import agent.redact as _redact_mod
+    _redact_mod._REDACT_ENABLED_BY_HOME.clear()
+    _redact_mod._VAULT_REDACTION_VALUES.clear()
+    yield
+    _redact_mod._REDACT_ENABLED_BY_HOME.clear()
+    _redact_mod._VAULT_REDACTION_VALUES.clear()
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 
