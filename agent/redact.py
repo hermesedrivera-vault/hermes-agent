@@ -37,6 +37,20 @@ _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
 
+# Cycle 3 (2026-10-31): partial-secret redaction. A full registered value is caught by the
+# exact-substring pass below, but `head -c 40 .env`, `python3 -c "print(open('.env').read()
+# [:20])"`, `cut -c1-15`, or a middle slice only ever emit a FRAGMENT of the secret -- never
+# the whole value -- so the exact pass misses them. Catching "any run of >=12 chars of a
+# registered secret" with a naive "is this substring of text in secret" scan would be
+# O(len(text) * len(secret)) per secret; instead we index every registered secret into the
+# set of its own 12-char windows ("shingles") ONCE per registry change, then scan the text in
+# a single O(len(text)) pass checking set membership (hash lookup, not a substring search) at
+# each position. 12 chars is long enough that an 11-char coincidental overlap with an unrelated
+# string must NOT trip it (tested).
+_VAULT_SHINGLE_LEN = 12
+_VAULT_SHINGLE_CACHE: dict = {}       # home_key -> (generation, frozenset[str])
+_VAULT_REDACTION_GENERATION: dict = {}  # home_key -> int, bumped on every register/clear
+
 
 def _vault_scope() -> str:
     from hermes_constants import get_hermes_home
@@ -49,24 +63,174 @@ def register_vault_redaction_value(value) -> None:
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
     it to (CR/LF stripped), since that is what the page holds.
+
+    Cycle 3 (2026-10-31): also registers hex and base64 (standard + urlsafe, with and without
+    padding) encodings of values >= 16 chars. Exact-substring matching (redact_registered_
+    vault_values) cannot catch a secret that was transcoded -- `base64 .env` / `xxd .env` output
+    never contains the literal secret string as a substring, only its encoded bytes. This closes
+    that gap the same way the rest of this registry works: register the value the output will
+    actually contain, don't add a new redaction pipeline. The length floor avoids flooding the
+    bucket with encodings of short, false-positive-prone values.
     """
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
+        candidates = [value, normalized]
+        if len(value) >= 16:
+            import base64 as _b64
+            raw = value.encode("utf-8", errors="ignore")
+            try:
+                # hex is byte-position-independent (1 byte -> 2 hex chars, no cross-byte
+                # dependency), so a single literal registration reliably catches `xxd`/`od -A x`
+                # output regardless of where the secret sits in the source file.
+                candidates.append(raw.hex())
+            except Exception:
+                pass
+            # base64 is NOT position-independent (3-byte -> 4-char blocks depend on the byte
+            # offset mod 3), so no fixed literal substring reliably matches `base64` output at
+            # every possible alignment. That case is instead handled by a decode-and-check scan
+            # (_redact_base64_encoded_secrets, below) run from redact_registered_vault_values.
+        for v in candidates:
             if v:
                 bucket.pop(v, None)  # re-registering refreshes recency
                 bucket[v] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _VAULT_REDACTION_GENERATION[_vault_scope()] = _VAULT_REDACTION_GENERATION.get(_vault_scope(), 0) + 1
+
 
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+        scope = _vault_scope()
+        _VAULT_REDACTION_VALUES.pop(scope, None)
+        _VAULT_REDACTION_GENERATION[scope] = _VAULT_REDACTION_GENERATION.get(scope, 0) + 1
+
+
+def _get_partial_secret_shingles(home_key: str, bucket: dict) -> frozenset:
+    """Cached set of every registered secret's 12-char sliding-window substrings for this
+    profile, rebuilt only when the registry actually changed (generation counter), not on
+    every redact call. ``bucket`` values are only full/derived-encoding strings (hex, base64)
+    registered by register_vault_redaction_value; hex/base64 forms are skipped here since a
+    partial HEX/BASE64 fragment is not what "12 consecutive characters of the secret" means
+    (it would also balloon false positives on ordinary hex/base64-looking output)."""
+    generation = _VAULT_REDACTION_GENERATION.get(home_key, 0)
+    cached = _VAULT_SHINGLE_CACHE.get(home_key)
+    if cached is not None and cached[0] == generation:
+        return cached[1]
+    shingles = set()
+    for value in bucket:
+        if len(value) < _VAULT_SHINGLE_LEN:
+            continue
+        for i in range(len(value) - _VAULT_SHINGLE_LEN + 1):
+            shingles.add(value[i:i + _VAULT_SHINGLE_LEN])
+    frozen = frozenset(shingles)
+    _VAULT_SHINGLE_CACHE[home_key] = (generation, frozen)
+    return frozen
+
+
+def _redact_partial_secret_matches(text: str) -> str:
+    """Mask any run of >= 12 consecutive characters that matches part of a registered secret
+    (prefix, suffix, or middle), even when the full value is never present in the output.
+    Single O(len(text)) pass: a hash-set membership check at each position, not a substring
+    search against each secret (see the shingle-index comment above _VAULT_SHINGLE_LEN)."""
+    if not text or len(text) < _VAULT_SHINGLE_LEN:
+        return text
+    with _VAULT_REDACTION_LOCK:
+        home_key = _vault_scope()
+        bucket = _VAULT_REDACTION_VALUES.get(home_key)
+        if not bucket:
+            return text
+        shingles = _get_partial_secret_shingles(home_key, bucket)
+    if not shingles:
+        return text
+    n = len(text)
+    k = _VAULT_SHINGLE_LEN
+    matched = bytearray(n)  # 1 where this character is inside a matched run
+    any_match = False
+    for i in range(n - k + 1):
+        if text[i:i + k] in shingles:
+            any_match = True
+            for j in range(i, i + k):
+                matched[j] = 1
+    if not any_match:
+        return text
+    out = []
+    i = 0
+    while i < n:
+        if matched[i]:
+            j = i
+            while j < n and matched[j]:
+                j += 1
+            out.append("«redacted-vault-secret-partial»")
+            i = j
+        else:
+            j = i
+            while j < n and not matched[j]:
+                j += 1
+            out.append(text[i:j])
+            i = j
+    return "".join(out)
+
+
+
+_SECRET_VALUES_REGISTERED_FOR_HOME: set = set()
+_SECRET_VALUES_REGISTER_LOCK = threading.Lock()
+
+
+def register_known_secret_values() -> int:
+    """Register every .env / config.yaml secret VALUE for unconditional model-facing
+    redaction, reusing the same registry the browser-vault fill path uses.
+
+    Cycle 3 (2026-10-31): extends the existing vault mechanism rather than building a
+    second one. Pattern-based redaction (``_should_redact_assignment`` et al.) depends
+    on recognizing the command/text shape -- a 2026-10-31 incident showed it can miss a
+    secret line when that shape detection fails (see ``_command_segments`` fix, same
+    date). Registering the literal VALUE here means ``redact_registered_vault_values``
+    strips it from any output regardless of shape, as a second independent layer.
+    Call once at startup (gateway/run.py, hermes_cli/main.py, cli.py); idempotent per
+    Hermes home, safe to call again after a key rotation to pick up the new value.
+    """
+    home = _vault_scope()
+    with _SECRET_VALUES_REGISTER_LOCK:
+        pass  # idempotency is per-value inside register_vault_redaction_value; always safe to re-run
+    count = 0
+    try:
+        from hermes_cli.config import load_env, load_config_readonly
+    except Exception:
+        return 0
+    try:
+        for key, value in (load_env() or {}).items():
+            if isinstance(value, str) and value and _key_has_secret_keyword(key):
+                register_vault_redaction_value(value)
+                count += 1
+    except Exception:
+        logger.warning("register_known_secret_values: could not load .env", exc_info=True)
+
+    def _walk(node, path_key=""):
+        nonlocal count
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and v and _key_has_secret_keyword(str(k)):
+                    register_vault_redaction_value(v)
+                    count += 1
+                else:
+                    _walk(v, str(k))
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item, path_key)
+
+    try:
+        _walk(load_config_readonly() or {})
+    except Exception:
+        logger.warning("register_known_secret_values: could not load config.yaml", exc_info=True)
+    with _SECRET_VALUES_REGISTER_LOCK:
+        _SECRET_VALUES_REGISTERED_FOR_HOME.add(home)
+    logger.info("register_known_secret_values: registered %d secret value(s) for redaction (home=%s)", count, home)
+    return count
 
 
 def redact_registered_vault_values(text: str) -> str:
@@ -79,7 +243,41 @@ def redact_registered_vault_values(text: str) -> str:
     for value in values:
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
+    if values:
+        text = _redact_base64_encoded_secrets(text, values)
+        text = _redact_partial_secret_matches(text)
     return text
+
+
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{20,}={0,2}")
+
+
+def _redact_base64_encoded_secrets(text: str, known_values) -> str:
+    """Catch a registered secret transcoded through `base64`/`openssl base64`, which the literal
+    substring scrub above cannot: base64 groups bytes in 3s, so a secret's own encoding only
+    reproduces as a clean substring of the whole-file encoding 1 time in 3 (byte offset mod 3).
+    Decode-and-check instead of trying to pre-register every alignment: scan for base64-looking
+    runs, decode each, and if the decoded bytes contain a known secret value, mask the whole run.
+    """
+    import base64 as _b64
+    known_bytes = [v.encode("utf-8", errors="ignore") for v in known_values if len(v) >= 16]
+    if not known_bytes:
+        return text
+
+    def _try_mask(m: re.Match) -> str:
+        token = m.group(0)
+        for variant in (token, token.replace("-", "+").replace("_", "/")):
+            padded = variant + "=" * (-len(variant) % 4)
+            try:
+                decoded = _b64.b64decode(padded, validate=False)
+            except Exception:
+                continue
+            if any(kb in decoded for kb in known_bytes):
+                return "«redacted-vault-secret-b64»"
+        return token
+
+    return _BASE64_RUN_RE.sub(_try_mask, text)
+
 
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
@@ -1034,9 +1232,19 @@ _HOME_PREFIXES = ("$HOME/", "${HOME}/")
 
 
 def _command_segments(command: str) -> list[str]:
-    """Pipeline/sequence segments, split only on unquoted ``| ; &`` so an
+    """Pipeline/sequence segments, split only on unquoted ``| ; & \\n`` so an
     ``awk '{print $1; print $2}'`` program or ``grep 'foo|bar'`` pattern stays one
-    segment. Backslash is not an escape (Windows ``C:\\Users\\...``)."""
+    segment. Backslash is not an escape (Windows ``C:\\\\Users\\\\...``).
+
+    SECURITY FIX 2026-10-31 (Cycle 3): newline added as a separator. Before this fix,
+    a multi-line terminal/execute_code script where a secret-file read (``grep ...
+    config.yaml``, ``cat .env``) appeared on a line AFTER an unrelated command (e.g.
+    ``python3 -c "..."``, ``cd``) was invisible to ``_command_reads_secret_file`` --
+    the whole script collapsed into one segment whose first token (``python3``) is not
+    a file-read command, so the later line's secret-file read was never checked. That
+    set ``code_file=True`` in ``redact_terminal_output``, which skips the KEY: VALUE
+    assignment redaction pass for the ENTIRE combined output, including the otherwise-
+    redactable secret line. Confirmed reproducible 2026-10-31 against dummy values."""
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None
@@ -1050,7 +1258,7 @@ def _command_segments(command: str) -> list[str]:
             quote = ch
             buf.append(ch)
             continue
-        if ch in "|;&":
+        if ch in "|;&\n\r":
             seg = "".join(buf).strip()
             if seg:
                 segments.append(seg)

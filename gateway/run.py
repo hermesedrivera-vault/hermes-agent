@@ -2100,6 +2100,20 @@ def _bridge_config_to_env(_cfg: dict) -> None:
     _security_cfg = _cfg.get("security", {})
     if isinstance(_security_cfg, dict) and _security_cfg.get("redact_secrets") is not None:
         os.environ["HERMES_REDACT_SECRETS"] = str(_security_cfg["redact_secrets"]).lower()
+    # Cycle 3 (2026-10-31): register every .env / config.yaml secret VALUE for
+    # unconditional model-facing redaction (agent/redact.py:redact_registered_vault_values,
+    # the same vault-fill mechanism, extended) -- independent of the redact_secrets toggle
+    # above and of pattern/command-shape detection. Must run once per gateway process, after
+    # the active profile's HERMES_HOME/.env/config.yaml are all resolved (true at this point:
+    # _cfg is the fully-loaded profile config). Best-effort: a failure here must never block
+    # gateway startup, so it's caught and logged rather than raised.
+    try:
+        from agent.redact import register_known_secret_values
+        register_known_secret_values()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "register_known_secret_values() failed at gateway startup -- value-based secret "
+            "redaction may be incomplete this run", exc_info=True)
     # Media policy uses the shared bridge so standalone entrypoints (`hermes cron run`) match.
     _gateway_cfg = _cfg.get("gateway", {})
     if isinstance(_gateway_cfg, dict):

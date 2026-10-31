@@ -715,6 +715,18 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # owns that argv check for every dotenv load in the process. See #73381.
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
+# Cycle 3 (2026-10-31): register every .env / config.yaml secret VALUE for unconditional
+# model-facing redaction, same mechanism/registry as gateway/run.py's hook (see that
+# comment for rationale). HERMES_HOME is already pinned to the active --profile at this
+# point (see the pre-parse above), so this correctly scopes to the right profile's .env.
+# Best-effort: must never block CLI/cron/gateway startup.
+try:
+    from agent.redact import register_known_secret_values as _register_known_secret_values
+    _register_known_secret_values()
+except Exception:
+    pass  # redaction stays pattern-based only this run; gateway/run.py retries this hook
+          # on its own startup path, so a gateway-mode process self-heals even if this fails.
+
 # Bridge security.redact_secrets → HERMES_REDACT_SECRETS BEFORE hermes_logging
 # imports agent.redact, which snapshots the flag exactly once at import. A
 # .env value still wins — this is config.yaml fallback only. network.force_ipv4
