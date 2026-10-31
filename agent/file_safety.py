@@ -7,6 +7,7 @@ clear denial for models that respect tool errors plus a visible audit trail.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 from pathlib import Path
@@ -236,8 +237,31 @@ def build_write_approval_paths(home: str) -> set[str]:
     ``ProxyCommand`` / ``Match exec``. Interactive file tools prompt
     (approve-once/session/always, like the terminal tool's ``~/.ssh`` gate);
     non-interactive callers (ACP shims, background jobs) fail closed.
+
+    ``profiles/*/config.yaml`` (2026-10-31, cycle3): any OTHER profile's
+    config.yaml -- not the acting profile's own, see #45947's deliberate
+    carve-out above for why the default profile's own config.yaml stays
+    unguarded -- is gated too. A profile with its own ``file`` toolset denied
+    (e.g. a locked-down chat-only profile) cannot reach this path itself
+    either way; this specifically closes the path for a DIFFERENT profile
+    (e.g. the default/account-owner profile) editing someone else's profile
+    config without a human in the loop. Globbed fresh each call rather than
+    cached, so a newly created profile is covered without a restart.
+
+    NOTE: ``home`` here is an OS-home-directory candidate from ``_guard_homes()``
+    (``~``, real home, subprocess home, profile home) -- NOT ``HERMES_HOME``.
+    Profiles live under ``HERMES_HOME`` (``~/.hermes/profiles/``), a
+    subdirectory of the OS home, not directly under it (``~/profiles/`` is
+    not where they are). So this globs ``_hermes_home_path()`` directly,
+    independent of the ``home`` parameter -- found live when the first version
+    of this fix globbed under ``home`` and silently matched nothing.
     """
-    return {os.path.realpath(os.path.join(home, ".ssh", "config"))}
+    paths = {os.path.realpath(os.path.join(home, ".ssh", "config"))}
+    with suppress(Exception):
+        hermes_home = _hermes_home_path()
+        for p in glob.glob(os.path.join(str(hermes_home), "profiles", "*", "config.yaml")):
+            paths.add(os.path.realpath(p))
+    return paths
 
 
 # HERMES_HOME / root subpaths that the agent's generic file tools must not

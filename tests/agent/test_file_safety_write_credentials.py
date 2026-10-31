@@ -94,3 +94,45 @@ class TestProfileHomeProcessHome:
             assert fs.is_write_denied(str(benign)) is False, benign
             assert fs.is_write_approval_required(str(benign)) is False, benign
         assert fs.is_write_denied("~nosuchuser-hopefully/.ssh/authorized_keys") is False
+
+
+class TestOtherProfileConfigWriteApproval:
+    """2026-10-31 (cycle3): profiles/*/config.yaml for ANY profile -- not just kenneth-rosa --
+    requires approval to write. Found live: a default-profile write to
+    profiles/kenneth-rosa/config.yaml landed with zero approval prompt before this fix, even
+    though that profile's own config.yaml controls its toolset lockdown. The acting profile's
+    OWN config.yaml stays unguarded (see #45947's WRITABLE_CONTROL_FILES carve-out above) --
+    this only covers a DIFFERENT profile's config, which only another profile (e.g. the
+    default/account-owner one, since a locked-down profile has ``file`` denied outright
+    anyway) could ever reach."""
+
+    def test_other_profile_config_requires_approval(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes_home"
+        other_profile_dir = home / "profiles" / "kenneth-rosa"
+        other_profile_dir.mkdir(parents=True)
+        cfg_path = other_profile_dir / "config.yaml"
+        cfg_path.write_text("agent:\n  disabled_toolsets: []\n")
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: home)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: home.parent)
+
+        assert fs.is_write_approval_required(str(cfg_path)), (
+            "profiles/kenneth-rosa/config.yaml must require approval to write"
+        )
+        assert fs.is_write_denied(str(cfg_path)) is False, (
+            "approval-gated, not hard-denied -- the user can still approve the edit"
+        )
+
+    def test_new_profile_config_covered_without_restart(self, tmp_path, monkeypatch):
+        """build_write_approval_paths globs fresh each call -- a profile created mid-session
+        (no code reload needed) is covered the first time its config.yaml exists on disk."""
+        home = tmp_path / "hermes_home"
+        (home / "profiles").mkdir(parents=True)
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: home)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: home.parent)
+
+        new_profile_dir = home / "profiles" / "brand-new-profile"
+        new_profile_dir.mkdir()
+        new_cfg = new_profile_dir / "config.yaml"
+        new_cfg.write_text("agent: {}\n")
+
+        assert fs.is_write_approval_required(str(new_cfg))
