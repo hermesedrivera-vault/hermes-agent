@@ -69,6 +69,62 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
+_SECRET_VALUES_REGISTERED_FOR_HOME: set = set()
+_SECRET_VALUES_REGISTER_LOCK = threading.Lock()
+
+
+def register_known_secret_values() -> int:
+    """Register every .env / config.yaml secret VALUE for unconditional model-facing
+    redaction, reusing the same registry the browser-vault fill path uses.
+
+    Cycle 3 (2026-10-31): extends the existing vault mechanism rather than building a
+    second one. Pattern-based redaction (``_should_redact_assignment`` et al.) depends
+    on recognizing the command/text shape -- a 2026-10-31 incident showed it can miss a
+    secret line when that shape detection fails (see ``_command_segments`` fix, same
+    date). Registering the literal VALUE here means ``redact_registered_vault_values``
+    strips it from any output regardless of shape, as a second independent layer.
+    Call once at startup (gateway/run.py, hermes_cli/main.py, cli.py); idempotent per
+    Hermes home, safe to call again after a key rotation to pick up the new value.
+    """
+    home = _vault_scope()
+    with _SECRET_VALUES_REGISTER_LOCK:
+        pass  # idempotency is per-value inside register_vault_redaction_value; always safe to re-run
+    count = 0
+    try:
+        from hermes_cli.config import load_env, load_config_readonly
+    except Exception:
+        return 0
+    try:
+        for key, value in (load_env() or {}).items():
+            if isinstance(value, str) and value and _key_has_secret_keyword(key):
+                register_vault_redaction_value(value)
+                count += 1
+    except Exception:
+        logger.warning("register_known_secret_values: could not load .env", exc_info=True)
+
+    def _walk(node, path_key=""):
+        nonlocal count
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and v and _key_has_secret_keyword(str(k)):
+                    register_vault_redaction_value(v)
+                    count += 1
+                else:
+                    _walk(v, str(k))
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item, path_key)
+
+    try:
+        _walk(load_config_readonly() or {})
+    except Exception:
+        logger.warning("register_known_secret_values: could not load config.yaml", exc_info=True)
+    with _SECRET_VALUES_REGISTER_LOCK:
+        _SECRET_VALUES_REGISTERED_FOR_HOME.add(home)
+    logger.info("register_known_secret_values: registered %d secret value(s) for redaction (home=%s)", count, home)
+    return count
+
+
 def redact_registered_vault_values(text: str) -> str:
     """Exact-substring scrub of every vault secret value registered for the current profile."""
     if not isinstance(text, str) or not text:
@@ -1034,9 +1090,19 @@ _HOME_PREFIXES = ("$HOME/", "${HOME}/")
 
 
 def _command_segments(command: str) -> list[str]:
-    """Pipeline/sequence segments, split only on unquoted ``| ; &`` so an
+    """Pipeline/sequence segments, split only on unquoted ``| ; & \\n`` so an
     ``awk '{print $1; print $2}'`` program or ``grep 'foo|bar'`` pattern stays one
-    segment. Backslash is not an escape (Windows ``C:\\Users\\...``)."""
+    segment. Backslash is not an escape (Windows ``C:\\\\Users\\\\...``).
+
+    SECURITY FIX 2026-10-31 (Cycle 3): newline added as a separator. Before this fix,
+    a multi-line terminal/execute_code script where a secret-file read (``grep ...
+    config.yaml``, ``cat .env``) appeared on a line AFTER an unrelated command (e.g.
+    ``python3 -c "..."``, ``cd``) was invisible to ``_command_reads_secret_file`` --
+    the whole script collapsed into one segment whose first token (``python3``) is not
+    a file-read command, so the later line's secret-file read was never checked. That
+    set ``code_file=True`` in ``redact_terminal_output``, which skips the KEY: VALUE
+    assignment redaction pass for the ENTIRE combined output, including the otherwise-
+    redactable secret line. Confirmed reproducible 2026-10-31 against dummy values."""
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None
@@ -1050,7 +1116,7 @@ def _command_segments(command: str) -> list[str]:
             quote = ch
             buf.append(ch)
             continue
-        if ch in "|;&":
+        if ch in "|;&\n\r":
             seg = "".join(buf).strip()
             if seg:
                 segments.append(seg)
