@@ -86,6 +86,19 @@ def test_generic_secret_and_token_json_basenames_denied_for_read():
     assert get_read_block_error("/tmp/token_bucket.py") is None
 
 
+def test_token_json_with_no_middle_segment_is_denied():
+    """Regression: the original _GENERIC_TOKEN_JSON_RE required a separator char between
+    "token" and ".json" (token[._-].*\\.json$), which matched "token_bucket.json" but NOT the
+    single most common real case -- "google_token.json" / bare "token.json" -- because the one
+    dot present got consumed as the required separator, leaving nothing to match \\.json$.
+    Found live on 2026-10-31: the actual Gmail OAuth token file was NOT denied by this rule."""
+    assert get_read_block_error("/home/hermes/.hermes/google_token.json") is not None
+    assert get_read_block_error("/tmp/token.json") is not None
+    assert get_read_block_error("/tmp/access_token.json") is not None
+    # must not widen into an unrelated word that merely starts with "token"
+    assert get_read_block_error("/tmp/tokenizer.json") is None
+
+
 def test_base64_encoded_secret_is_redacted_despite_alignment():
     # base64 groups bytes in 3s, so a naive "register the one literal encoding" approach only
     # catches 1-in-3 byte alignments. Confirm several different prefix lengths (i.e. different

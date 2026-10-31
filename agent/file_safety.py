@@ -348,7 +348,15 @@ _DID_SUFFIX = (
 # limiter, not a credential) is not falsely blocked. False negatives (a secret file named
 # something unrelated) are expected -- this is a basename heuristic, not a content scan.
 _GENERIC_SECRET_BASENAME_RE = re.compile(r"(?:^|[._-])secret(?:s)?(?:[._-]|$)", re.IGNORECASE)
-_GENERIC_TOKEN_JSON_RE = re.compile(r"(?:^|[._-])token(?:s)?[._-].*\.json$", re.IGNORECASE)
+_GENERIC_TOKEN_JSON_RE = re.compile(r"(?:^|[._-])token(?:s)?(?:[._-][^/]*)?\.json$", re.IGNORECASE)
+# ^ 2026-10-31 fix: the prior pattern required a separator character BETWEEN "token" and
+# ".json" (token[._-].*\.json$), which matches "token_bucket.json" but NOT the single most
+# common real case -- "google_token.json" / bare "token.json" -- because there is only one
+# dot total and it gets consumed as the required separator, leaving nothing to match the
+# \.json$ tail. Found live: google_token.json (the actual Gmail OAuth token) was NOT denied.
+# Making the middle segment optional closes this without widening to "tokenizer.json" etc
+# (still requires "token"/"tokens" at a start/separator boundary, then either end straight
+# into ".json" or one more [._-]-prefixed segment).
 
 
 def _looks_like_generic_secret_basename(name: str) -> bool:
