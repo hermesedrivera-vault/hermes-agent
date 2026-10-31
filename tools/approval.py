@@ -1073,8 +1073,29 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     only), the user's own approvals.deny rules ("never, even under yolo"), and
     deletion of the Python interpreter/venv this very runtime boots from (a
     delete the agent cannot walk back — the next start fails before any tool
-    can run, #58748)."""
+    can run, #58748).
+
+    SECURITY ADDITION 2026-10-31 (Cycle 3): also an unconditional floor for commands
+    that read a secret-bearing file (.env*, shell rc, Hermes config.yaml) to stdout --
+    DENIED outright, for every profile including default, never approval-prompted.
+    Root cause this closes: approval was previously only required for commands matching
+    a dangerous-pattern denylist; `find /`, `env | grep`, and a plain `cat .env` never
+    matched that denylist and ran with zero human involvement (2026-09-06 kenneth-rosa
+    incident). This is read-only defense-in-depth, not a sandbox: indirect reads
+    (`sudo cat .env`, `$(cat .env)`) are not detected, same limitation as
+    `_command_reads_secret_file` generally -- see agent/redact.py."""
     from agent.runtime_self_protection import command_deletes_runtime
+    from agent.redact import _command_reads_secret_file
+
+    secret_target = _command_reads_secret_file(command)
+    if secret_target:
+        logger.warning("Secret-file-read block: command reads a protected secret-bearing "
+                        "file (command: %s)", command[:200])
+        return _hardline_block_result(
+            "command reads a secret-bearing file (.env/.hermes config/credential store) -- "
+            "denied for every profile, not approval-prompted. If this tool genuinely needs "
+            "the value, use the dedicated startup secret-loading path instead of an agent tool call.",
+            command)
 
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
