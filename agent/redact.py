@@ -202,9 +202,35 @@ def register_known_secret_values() -> int:
         from hermes_cli.config import load_env, load_config_readonly
     except Exception:
         return 0
+    def _should_register(key: str, value: str) -> bool:
+        """Mirrors _should_redact_assignment's own gating (same file, pattern-based path):
+        an unambiguous keyword (api_key, secret, passwd, credential, bearer...) is enough on
+        its own, but a bare/weak keyword (key, auth, pass, pw) also needs the value to look
+        credential-shaped. Without this second gate, register_known_secret_values() was
+        registering benign enum-style config values -- proxy.credential_source: "env",
+        desktop.password_store: "auto", voice.record_key: a 6-char keybinding -- purely
+        because their KEY NAME contains "credential"/"password"/"key", then globally
+        substring-replacing that short common string (e.g. "env") anywhere it appeared in
+        ANY tool output, corrupting unrelated text like "environment_probe". Found live on
+        2026-10-31 in the first post-merge smoke test (config.yaml read back mangled).
+
+        Second gap found while fixing the first: _STRONG_KEY_KEYWORD_RE treats bare
+        "credential"/"password" as unambiguous, so "credential_source"/"password_store"
+        (metadata fields naming WHERE a secret lives, not the secret itself) still bypassed
+        the shape check and let "env"/"auto" (3-4 chars) through. No genuine secret is ever
+        3-4 characters, so an absolute floor is the decisive guard here, independent of
+        keyword strength -- the shape check alone isn't enough when the key-name heuristic
+        itself is ambiguous.
+        """
+        if len(value) < 8:
+            return False
+        if _has_word_bounded_keyword(key, _STRONG_KEY_KEYWORD_RE):
+            return True
+        return _looks_like_opaque_credential(value)
+
     try:
         for key, value in (load_env() or {}).items():
-            if isinstance(value, str) and value and _key_has_secret_keyword(key):
+            if isinstance(value, str) and value and _key_has_secret_keyword(key) and _should_register(key, value):
                 register_vault_redaction_value(value)
                 count += 1
     except Exception:
@@ -214,7 +240,7 @@ def register_known_secret_values() -> int:
         nonlocal count
         if isinstance(node, dict):
             for k, v in node.items():
-                if isinstance(v, str) and v and _key_has_secret_keyword(str(k)):
+                if isinstance(v, str) and v and _key_has_secret_keyword(str(k)) and _should_register(str(k), v):
                     register_vault_redaction_value(v)
                     count += 1
                 else:
