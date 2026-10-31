@@ -37,6 +37,20 @@ _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
 
+# Cycle 3 (2026-10-31): partial-secret redaction. A full registered value is caught by the
+# exact-substring pass below, but `head -c 40 .env`, `python3 -c "print(open('.env').read()
+# [:20])"`, `cut -c1-15`, or a middle slice only ever emit a FRAGMENT of the secret -- never
+# the whole value -- so the exact pass misses them. Catching "any run of >=12 chars of a
+# registered secret" with a naive "is this substring of text in secret" scan would be
+# O(len(text) * len(secret)) per secret; instead we index every registered secret into the
+# set of its own 12-char windows ("shingles") ONCE per registry change, then scan the text in
+# a single O(len(text)) pass checking set membership (hash lookup, not a substring search) at
+# each position. 12 chars is long enough that an 11-char coincidental overlap with an unrelated
+# string must NOT trip it (tested).
+_VAULT_SHINGLE_LEN = 12
+_VAULT_SHINGLE_CACHE: dict = {}       # home_key -> (generation, frozenset[str])
+_VAULT_REDACTION_GENERATION: dict = {}  # home_key -> int, bumped on every register/clear
+
 
 def _vault_scope() -> str:
     from hermes_constants import get_hermes_home
@@ -84,13 +98,83 @@ def register_vault_redaction_value(value) -> None:
                 bucket[v] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _VAULT_REDACTION_GENERATION[_vault_scope()] = _VAULT_REDACTION_GENERATION.get(_vault_scope(), 0) + 1
 
 
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+        scope = _vault_scope()
+        _VAULT_REDACTION_VALUES.pop(scope, None)
+        _VAULT_REDACTION_GENERATION[scope] = _VAULT_REDACTION_GENERATION.get(scope, 0) + 1
+
+
+def _get_partial_secret_shingles(home_key: str, bucket: dict) -> frozenset:
+    """Cached set of every registered secret's 12-char sliding-window substrings for this
+    profile, rebuilt only when the registry actually changed (generation counter), not on
+    every redact call. ``bucket`` values are only full/derived-encoding strings (hex, base64)
+    registered by register_vault_redaction_value; hex/base64 forms are skipped here since a
+    partial HEX/BASE64 fragment is not what "12 consecutive characters of the secret" means
+    (it would also balloon false positives on ordinary hex/base64-looking output)."""
+    generation = _VAULT_REDACTION_GENERATION.get(home_key, 0)
+    cached = _VAULT_SHINGLE_CACHE.get(home_key)
+    if cached is not None and cached[0] == generation:
+        return cached[1]
+    shingles = set()
+    for value in bucket:
+        if len(value) < _VAULT_SHINGLE_LEN:
+            continue
+        for i in range(len(value) - _VAULT_SHINGLE_LEN + 1):
+            shingles.add(value[i:i + _VAULT_SHINGLE_LEN])
+    frozen = frozenset(shingles)
+    _VAULT_SHINGLE_CACHE[home_key] = (generation, frozen)
+    return frozen
+
+
+def _redact_partial_secret_matches(text: str) -> str:
+    """Mask any run of >= 12 consecutive characters that matches part of a registered secret
+    (prefix, suffix, or middle), even when the full value is never present in the output.
+    Single O(len(text)) pass: a hash-set membership check at each position, not a substring
+    search against each secret (see the shingle-index comment above _VAULT_SHINGLE_LEN)."""
+    if not text or len(text) < _VAULT_SHINGLE_LEN:
+        return text
+    with _VAULT_REDACTION_LOCK:
+        home_key = _vault_scope()
+        bucket = _VAULT_REDACTION_VALUES.get(home_key)
+        if not bucket:
+            return text
+        shingles = _get_partial_secret_shingles(home_key, bucket)
+    if not shingles:
+        return text
+    n = len(text)
+    k = _VAULT_SHINGLE_LEN
+    matched = bytearray(n)  # 1 where this character is inside a matched run
+    any_match = False
+    for i in range(n - k + 1):
+        if text[i:i + k] in shingles:
+            any_match = True
+            for j in range(i, i + k):
+                matched[j] = 1
+    if not any_match:
+        return text
+    out = []
+    i = 0
+    while i < n:
+        if matched[i]:
+            j = i
+            while j < n and matched[j]:
+                j += 1
+            out.append("«redacted-vault-secret-partial»")
+            i = j
+        else:
+            j = i
+            while j < n and not matched[j]:
+                j += 1
+            out.append(text[i:j])
+            i = j
+    return "".join(out)
+
 
 
 _SECRET_VALUES_REGISTERED_FOR_HOME: set = set()
@@ -161,6 +245,7 @@ def redact_registered_vault_values(text: str) -> str:
             text = text.replace(value, "«redacted-vault-secret»")
     if values:
         text = _redact_base64_encoded_secrets(text, values)
+        text = _redact_partial_secret_matches(text)
     return text
 
 

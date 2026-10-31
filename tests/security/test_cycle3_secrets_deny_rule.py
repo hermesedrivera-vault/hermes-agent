@@ -115,6 +115,61 @@ def test_hex_encoded_secret_is_redacted():
         clear_vault_redaction_values()
 
 
+def test_partial_secret_fragments_12_or_more_chars_are_redacted():
+    """head -c / python slice / cut -c / middle slice -- a fragment, never the whole value."""
+    clear_vault_redaction_values()
+    try:
+        register_vault_redaction_value(DUMMY_KEY)
+        fragments = {
+            "head -c 40 .env": DUMMY_KEY[:40],            # whole value is < 40 chars here, still a "head" case
+            "python open().read()[:20]": DUMMY_KEY[:20],  # prefix
+            "cut -c1-15": DUMMY_KEY[:15],                 # shorter prefix
+            "12-char middle slice": DUMMY_KEY[10:22],     # neither prefix nor suffix
+        }
+        for label, frag in fragments.items():
+            assert len(frag) >= 12, f"{label} fixture must be >=12 chars to exercise this rule"
+            sample = f"irrelevant prefix text {frag} irrelevant suffix text"
+            out = redact_terminal_output(sample, command=label)
+            assert frag not in out, f"{label}: fragment leaked uncaught: {out!r}"
+    finally:
+        clear_vault_redaction_values()
+
+
+def test_11_char_shared_prefix_is_not_redacted():
+    """An unrelated 11-char string that happens to share the secret's first 10 chars must
+    pass through untouched -- the shingle length floor (12) is the false-positive guard."""
+    clear_vault_redaction_values()
+    try:
+        register_vault_redaction_value(DUMMY_KEY)
+        unrelated = DUMMY_KEY[:10] + "Z"  # 11 chars total, diverges at char 11
+        assert len(unrelated) == 11
+        sample = f"text {unrelated} text"
+        out = redact_terminal_output(sample, command="cat somefile")
+        assert unrelated in out, f"false positive: an unrelated 11-char string was redacted: {out!r}"
+    finally:
+        clear_vault_redaction_values()
+
+
+def test_partial_redaction_no_measurable_slowdown_on_1mb():
+    """Bound, not zero: a 1 MB single-call tool output is already an unusual case, and the
+    shingle scan is a single O(n) pass, not O(n*m) -- generous ceiling, not a tight SLA."""
+    import random
+    import string
+    import time
+
+    clear_vault_redaction_values()
+    try:
+        register_vault_redaction_value(DUMMY_KEY)
+        rng = random.Random(1234)
+        big = "".join(rng.choice(string.ascii_letters + string.digits + " \n") for _ in range(1_000_000))
+        start = time.monotonic()
+        redact_terminal_output(big, command="cat bigfile")
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.5, f"1MB redaction pass took {elapsed:.3f}s -- investigate before merge"
+    finally:
+        clear_vault_redaction_values()
+
+
 if __name__ == "__main__":
     import traceback
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
