@@ -127,9 +127,9 @@ def test_identical_requests_racing_to_lead_send_one_prompt(monkeypatch):
 
     real_follow = wait_mod._await_coalesced_leader
 
-    def follow(session_key, leader, payload):
+    def follow(session_key, leader, payload, **kwargs):
         settled.set()
-        return real_follow(session_key, leader, payload)
+        return real_follow(session_key, leader, payload, **kwargs)
 
     def notify(data):
         with notified_lock:
@@ -174,9 +174,9 @@ def test_followers_released_by_once_share_one_fresh_prompt(monkeypatch):
     follows: list[str] = []
     real_follow = wait_mod._await_coalesced_leader
 
-    def follow(session_key, leader, payload):
+    def follow(session_key, leader, payload, **kwargs):
         follows.append(leader.data["request_id"])
-        return real_follow(session_key, leader, payload)
+        return real_follow(session_key, leader, payload, **kwargs)
 
     monkeypatch.setattr(wait_mod, "_await_coalesced_leader", follow)
     results: list[dict] = []

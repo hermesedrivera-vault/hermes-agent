@@ -24,7 +24,7 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "created_at", "data", "event", "expired", "reason", "result", "settle")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -42,6 +42,11 @@ class _ApprovalEntry:
         self.cancelled: str | None = None
         # The prompt timed out unanswered; followers woken by its event adopt that timeout.
         self.expired = False
+        # Fix2-live-failure (2026-11-01): wall-clock birth time, monotonic. Lets the leader
+        # lookup refuse to adopt an entry that is stale/orphaned (its own calling thread never
+        # reached _drop_entry — e.g. abandoned/timed out upstream) instead of treating it as a
+        # live concurrent request forever.
+        self.created_at = time.monotonic()
 
 
 def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str) -> str:
@@ -103,7 +108,8 @@ def _hook_choice(resolved: bool, choice: str | None, extra: dict) -> str:
     return (choice or "timeout") if resolved else "timeout"
 
 
-def _await_coalesced_leader(session_key: str, leader, payload: dict):
+def _await_coalesced_leader(session_key: str, leader, payload: dict, *,
+                             follower_flags: dict | None = None):
     """Wait on an already-pending identical approval instead of re-prompting.
     Adopts the leader's decision: ``session``/``always`` → approval (same dict
     shape as a direct resolution; persistence stays the caller's and is
@@ -111,7 +117,23 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     leader's reason; leader timeout / our own deadline → unresolved. ``once``
     returns ``None``: single-use consent covers only the leader's execution,
     so the caller must issue a fresh prompt. Hooks fire with ``coalesced=True``
-    so observers see the follower's lifecycle without a duplicate prompt."""
+    so observers see the follower's lifecycle without a duplicate prompt.
+
+    Fix2-live-failure (2026-11-01): a follower that declared
+    ``allow_session=False``/``allow_permanent=False`` (ALWAYS-ask gates, e.g.
+    protected-instruction writes) must never inherit a ``session``/``always``
+    choice from the leader just because the command/pattern_keys text matches
+    — that flag is a server-side contract, not a UI hint. Treat it exactly
+    like a leader that hasn't answered yet: fall through to a fresh prompt.
+
+    ``follower_flags`` is explicit and keyword-only, defaulting to the SAFE
+    (most-restrictive) value -- not the leader's or any prior call's flags.
+    A thread-local or module-level default was rejected: a thread can be
+    reused across sessions/callers, and a missing or stale value would
+    silently recreate the exact "coalescing adopts a scope it shouldn't"
+    bug this function exists to prevent.
+    """
+    follower_flags = follower_flags or {"allow_session": False, "allow_permanent": False}
     _ctx._fire_approval_hook("pre_approval_request", **payload, coalesced=True)
     state = _poll_event(leader.event, session_key,
                         interrupt_log="Coalesced approval wait interrupted — "
@@ -129,6 +151,13 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
         resolved = choice is not None
     if choice == "once":
         # The post hook fires for the fresh prompt's own lifecycle, not here.
+        return None
+    if choice in ("session", "always") and not (follower_flags or {}).get(
+            "allow_session" if choice == "session" else "allow_permanent", True):
+        # The follower's own gate forbids this scope — never silently adopt
+        # it from a leader answered under looser (or unrelated) terms. No
+        # hook fires here either: from the follower's perspective nothing
+        # was ever decided, so it must re-prompt exactly like a fresh call.
         return None
     extra = {"cancelled": cancelled} if cancelled else {}
     return _finish(payload, resolved, choice, getattr(leader, "reason", None), coalesced=True, **extra)
@@ -160,6 +189,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "pattern_keys": list(approval_data.get("pattern_keys", [primary_key])),
         "session_key": session_key, "surface": surface,
     }
+    # Fix2-live-failure (2026-11-01): kept OUT of payload deliberately --
+    # payload is spread into pre_approval_request/post_approval_response
+    # hook kwargs, and those must stay byte-identical to before this fix
+    # (two existing tests assert exact hook-kwarg equality). Carried as a
+    # separate value so _await_coalesced_leader can still refuse to let a
+    # follower inherit a scope its OWN gate declared forbidden.
+    follower_flags = {
+        "allow_session": approval_data.get("allow_session", True),
+        "allow_permanent": approval_data.get("allow_permanent", True),
+    }
     keys = list(approval_data.get("pattern_keys") or [])
     entry = _ApprovalEntry(approval_data)
 
@@ -171,17 +210,29 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     # miss each other, both enqueue and the user gets duplicate prompts. A ``once`` releases the
     # followers to prompt for themselves; they re-coalesce behind whichever re-prompts first, so the
     # user still sees one prompt at a time (the answered leader is already off the queue).
+    #
+    # Fix2-live-failure (2026-11-01): three guards against a bogus "leader" match —
+    #   (1) never coalesce an ALWAYS-ask gate (protected_instruction_file) with anything, not even
+    #       another protected_instruction_file request: it must get its own prompt every time;
+    #   (2) a leader whose .result is already set is resolved, not pending — a still-queued one
+    #       is orphaned (its own caller never reached _drop_entry) and must not be adopted;
+    #   (3) a leader older than the approval timeout is stale for the same reason, defense in depth
+    #       in case (2) alone somehow missed it (e.g. result race).
+    _NO_COALESCE_KEYS = {"protected_instruction_file"}
+    _max_leader_age = max(_ctx._get_approval_timeout(), 0)
     while True:
         with _approval._lock:
             leader = None
-            if not preparing_terminal_approval():
+            if not preparing_terminal_approval() and not (_NO_COALESCE_KEYS & set(keys)):
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
                                if e.data.get("command") == approval_data.get("command")
-                               and list(e.data.get("pattern_keys") or []) == keys), None)
+                               and list(e.data.get("pattern_keys") or []) == keys
+                               and e.result is None
+                               and (time.monotonic() - e.created_at) <= _max_leader_age), None)
             if leader is None:
                 _enqueue()
                 break
-        adopted = _await_coalesced_leader(session_key, leader, payload)
+        adopted = _await_coalesced_leader(session_key, leader, payload, follower_flags=follower_flags)
         if adopted is not None:
             return adopted
 
