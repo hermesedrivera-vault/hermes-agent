@@ -1078,3 +1078,123 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
             reset_hermes_home_override(tok)
         assert err is not None
         assert "Refusing to write to Hermes config file" in err
+
+
+class TestOtherProfileConfigIsProtectedInstructionGated:
+    """cycle3 (2026-10-31) gap: a write from the default (or any other) profile's
+    session to ANOTHER profile's ``profiles/<name>/config.yaml`` used to land
+    silently — the exempt-home loop in ``_protected_instruction_reason`` skipped
+    it because the target sits inside the active profile's own exempt tree, and
+    the routine ``_check_approval_required_write`` gate never covered it either.
+    A live probe write to ``profiles/kenneth-rosa/config.yaml`` from the default
+    session proved this with zero approval prompt. This file carries
+    ``approvals.mode`` / ``security.*`` for the TARGET profile exactly like the
+    root ``config.yaml`` hard-block protects the ACTIVE profile's own copy, so it
+    must go through the ALWAYS-ask protected-instruction gate: one prompt every
+    time, no persisted scope, fail-closed with no human channel.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _gate_on(self, monkeypatch):
+        import tools.file_tools_write_guards as ft
+        monkeypatch.setattr(ft, "_protected_instruction_config", lambda: (True, []))
+        monkeypatch.setattr(ft, "_real_hermes_home_loaded", False)
+        monkeypatch.setattr(ft, "_real_hermes_home_cached", None)
+
+    def _layout(self, tmp_path: Path):
+        root = tmp_path / "home"
+        active = root / "profiles" / "default-session"
+        other = root / "profiles" / "kenneth-rosa"
+        for home in (active, other):
+            (home / "workspace").mkdir(parents=True)
+            (home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+        (root / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+        return root, active, other
+
+    def _write(self, path, content="injected"):
+        import json
+        from tools.file_tools import write_file_tool
+        return json.loads(write_file_tool(str(path), content))
+
+    def test_write_to_another_profiles_config_always_asks_and_is_not_exempt(self, tmp_path, monkeypatch):
+        """Reason-level: a cross-profile config.yaml is flagged even though it sits
+        inside the exempt home tree, and the reason label identifies the target profile."""
+        import tools.file_tools_write_guards as ft
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        root, active, other = self._layout(tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        token = set_hermes_home_override(str(active))
+        try:
+            assert os.path.realpath(str(root)) in ft._hermes_exempt_homes()
+            reason = ft._protected_instruction_reason(str(other / "config.yaml"))
+            assert reason == "profiles/kenneth-rosa/config.yaml"
+            # A sibling workspace file in the SAME profile stays ungated — this
+            # targets config.yaml specifically, not the whole profile tree.
+            assert ft._protected_instruction_reason(str(other / "workspace" / "note.txt")) is None
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_default_interactive_session_is_prompted_every_time(self, tmp_path, monkeypatch):
+        """Negative test (a): the write does NOT auto-pass for the default/interactive
+        session — the approval callback must actually be invoked, and a denial blocks
+        the write with the file left untouched."""
+        import tools.file_tools_write_guards as ft
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.terminal_tool import set_approval_callback
+
+        root, active, other = self._layout(tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        for name in ("HERMES_SINGLE_QUERY_SESSION", "HERMES_CRON_SESSION", "HERMES_SESSION_PLATFORM"):
+            monkeypatch.delenv(name, raising=False)
+        calls = []
+        set_approval_callback(lambda command, description, **kw: calls.append(command) or "deny")
+        target = other / "config.yaml"
+        token = set_hermes_home_override(str(active))
+        try:
+            res = self._write(target, "approvals:\n  mode: off\n")
+        finally:
+            reset_hermes_home_override(token)
+            set_approval_callback(None)
+
+        assert len(calls) == 1, "interactive session must be asked, not auto-passed"
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert target.read_text(encoding="utf-8") == "model:\n  default: x\n", "denied write must not land"
+
+        # Approving once lets exactly that one write through, with no persisted scope.
+        # (Read first to satisfy the unrelated stale-overwrite-blocker's baseline —
+        # this test is isolating the protected-instruction gate, not that guard.)
+        from tools.file_tools import read_file_tool
+        token = set_hermes_home_override(str(active))
+        try:
+            read_file_tool(str(target))
+            set_approval_callback(lambda command, description, **kw: calls.append(command) or "once")
+            res2 = self._write(target, "approvals:\n  mode: off\n")
+        finally:
+            reset_hermes_home_override(token)
+            set_approval_callback(None)
+        assert not res2.get("error"), res2
+        assert target.read_text(encoding="utf-8") == "approvals:\n  mode: off\n"
+
+    def test_background_caller_with_no_human_channel_is_denied_outright(self, tmp_path, monkeypatch):
+        """Negative test (b): a background/non-interactive caller (cron-style, no
+        approval callback registered, single-query/cron env markers set) is denied
+        outright — never silently approved, never left pending."""
+        import tools.file_tools_write_guards as ft
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.terminal_tool import set_approval_callback
+
+        root, active, other = self._layout(tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        set_approval_callback(None)  # no human channel at all
+        target = other / "config.yaml"
+        token = set_hermes_home_override(str(active))
+        try:
+            res = self._write(target, "approvals:\n  mode: off\n")
+        finally:
+            reset_hermes_home_override(token)
+
+        assert res.get("error") and "no interactive user or gateway is present" in res["error"]
+        assert "timed out" not in res["error"]
+        assert target.read_text(encoding="utf-8") == "model:\n  default: x\n"

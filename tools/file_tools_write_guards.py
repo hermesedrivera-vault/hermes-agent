@@ -229,6 +229,22 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
 
+    # profiles/<name>/config.yaml carries approvals.mode, security.* and other
+    # gate-weakening settings for OTHER profiles (and, under a named-profile
+    # scope, for the active one too) — exactly what the root config.yaml's own
+    # hard-block in ``_check_sensitive_path`` protects for the ACTIVE profile.
+    # Checked BEFORE the exempt-home loop below: that loop would otherwise skip
+    # it, since profiles/<name>/config.yaml sits inside the exempt home tree by
+    # design (project-local files live there and must stay unmolested). A named
+    # profile's own config is included deliberately: an edit from a session
+    # *inside* that profile, or from the default profile reaching across, are the
+    # same silent-degrade vector (cycle3 2026-10-31 live probe: a default-profile
+    # write to profiles/kenneth-rosa/config.yaml landed with zero approval).
+    for candidate in (normalized, resolved):
+        parts = candidate.replace("\\", "/").rstrip("/").split("/")
+        if len(parts) >= 3 and parts[-1].lower() == "config.yaml" and parts[-3].lower() == "profiles":
+            return f"profiles/{parts[-2]}/config.yaml"
+
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
     # mirror guard, write_approval); this gate targets PROJECT-LOCAL files only.
     # Must run before the ``.hermes`` component rule, which would match the home.
