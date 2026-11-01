@@ -1122,7 +1122,7 @@ def _redact_phone(m):
 # numbers, version strings, and other benign dashed numerics, so it is ONLY masked when a
 # tax-ID keyword appears near the match -- never on the bare shape alone (too many false
 # positives at this width, confirmed during the 2026-11-01 vault/ChromaDB/state.db inventory).
-_SSN_ITIN_RE = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
+_SSN_ITIN_RE = re.compile(r"(?<!\d)\d{3}[- ]\d{2}[- ]\d{4}(?!\d)")
 _EIN_RE = re.compile(r"(?<!\d)\d{2}-\d{7}(?!\d)")
 _EIN_KEYWORD_RE = re.compile(r"\bEIN\b|employer\s+identification|tax\s*[-\s]?id", re.IGNORECASE)
 _EIN_CONTEXT_WINDOW = 80  # chars of context on each side checked for the keyword
