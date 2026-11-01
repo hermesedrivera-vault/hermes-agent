@@ -1114,6 +1114,33 @@ def _redact_phone(m):
     return phone[:keep] + "****" + phone[-keep:]
 
 
+#   SSN / ITIN / EIN pattern masking (Ed, 2026-11-01, SSN/backup remediation item (b)).
+#
+# SSN and ITIN share the exact same ###-##-#### shape (ITIN is a subset distinguished only
+# by the first digit being 9, which doesn't matter for masking purposes -- both get the same
+# treatment). EIN (##-#######) is a much looser 9-digit shape that collides with invoice
+# numbers, version strings, and other benign dashed numerics, so it is ONLY masked when a
+# tax-ID keyword appears near the match -- never on the bare shape alone (too many false
+# positives at this width, confirmed during the 2026-11-01 vault/ChromaDB/state.db inventory).
+_SSN_ITIN_RE = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
+_EIN_RE = re.compile(r"(?<!\d)\d{2}-\d{7}(?!\d)")
+_EIN_KEYWORD_RE = re.compile(r"\bEIN\b|employer\s+identification|tax\s*[-\s]?id", re.IGNORECASE)
+_EIN_CONTEXT_WINDOW = 80  # chars of context on each side checked for the keyword
+
+
+def _redact_ssn_itin_ein(text: str) -> str:
+    text = _SSN_ITIN_RE.sub("[SSN-REDACTED]", text)
+    if _EIN_RE.search(text) and _EIN_KEYWORD_RE.search(text):
+        def _mask_ein(m: "re.Match[str]") -> str:
+            start = max(0, m.start() - _EIN_CONTEXT_WINDOW)
+            end = min(len(text), m.end() + _EIN_CONTEXT_WINDOW)
+            if _EIN_KEYWORD_RE.search(text[start:end]):
+                return "[EIN-REDACTED]"
+            return m.group(0)
+        text = _EIN_RE.sub(_mask_ein, text)
+    return text
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
                           redact_url_credentials: bool = False) -> str:
@@ -1161,6 +1188,11 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
     text = redact_registered_vault_values(text)
+    # SSN/ITIN/EIN are a hard model-egress boundary too (PII, not a configurable secret-redaction
+    # preference) -- scrubbed regardless of security.redact_secrets, same as vault values above.
+    # Added 2026-11-01 (Ed, SSN/backup remediation, item (b)).
+    if "-" in text:
+        text = _redact_ssn_itin_ein(text)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not
