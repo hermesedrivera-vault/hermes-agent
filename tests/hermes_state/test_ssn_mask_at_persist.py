@@ -6,6 +6,8 @@ SSN/EIN. Added 2026-11-01, Ed's SSN/backup remediation item (2b): FTS5
 the INSERT, not just at tool-output display time -- otherwise the plaintext
 lands in both `messages` and `messages_fts`.
 """
+import json
+
 import pytest
 
 from hermes_state import SessionDB
@@ -103,6 +105,24 @@ def test_batch_append_masks_ssn(db):
     contents = [r["content"] for r in rows]
     assert all(FAKE_SSN not in c for c in contents)
     assert any("[SSN-REDACTED]" in c for c in contents)
+
+
+# --- tool_calls column: a write_file call whose arguments embed an SSN ---
+
+def test_tool_call_arguments_ssn_masked_on_append(db):
+    sid = "s1"
+    db.create_session(sid, "cli", model="m")
+    tool_calls = [{
+        "id": "tc1", "type": "function",
+        "function": {"name": "write_file",
+                     "arguments": json.dumps({"path": "/tmp/x.txt", "content": f"SSN: {FAKE_SSN}"})},
+    }]
+    db.append_message(session_id=sid, role="assistant", content=None, tool_calls=tool_calls)
+    row = db._conn.execute(
+        "SELECT tool_calls FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", (sid,)
+    ).fetchone()
+    assert FAKE_SSN not in row["tool_calls"]
+    assert "[SSN-REDACTED]" in row["tool_calls"]
 
 
 # --- FTS5 index itself must never carry the plaintext (the actual gap being closed) ---

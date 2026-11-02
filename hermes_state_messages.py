@@ -284,7 +284,11 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         _str_or_none = lambda v: _scrub_surrogates(v) if isinstance(v, str) else None
         _reasoning = lambda key: msg.get(key) if keep_reasoning else None
         encoded_content = self._encode_content(msg.get("content"))
-        encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
+        if tool_calls:
+            from agent.redact import _redact_ssn_itin_ein
+            encoded_tool_calls = _redact_ssn_itin_ein(json.dumps(tool_calls))
+        else:
+            encoded_tool_calls = None
         encoded_tool_name = _scrub_surrogates(msg.get("tool_name"))
         display_metadata = msg.get("display_metadata")
         if msg.get(DATA_USE) and isinstance(display_metadata, (dict, type(None))):
