@@ -145,9 +145,19 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         A literal string carrying the reserved ``\\x00json:`` prefix is indistinguishable from
         stored structured content, so it is JSON-string-wrapped (decoded back verbatim on read)
         instead of written raw — a crafted import can't smuggle the marker in and have the read
-        path decode attacker-chosen structure."""
+        path decode attacker-chosen structure.
+
+        SSN/ITIN/EIN masking runs here too (Ed, 2026-11-01, SSN/backup remediation item (2b)): this is
+        the one choke point both ``append_message`` and ``append_messages_batch`` go through for every
+        role (user, assistant, tool), so it is where every row lands before the FTS5 insert trigger
+        indexes ``content`` -- masking after this point is too late, the plaintext would already be
+        in both tables. Covers typed user messages (never redacted upstream, unlike tool output) and
+        any tool output whose own redaction call site was missed.
+        """
         if isinstance(content, str):
             content = _sanitize_surrogates(content)
+            from agent.redact import _redact_ssn_itin_ein
+            content = _redact_ssn_itin_ein(content)
             if not content.startswith(cls._CONTENT_JSON_PREFIX):
                 return content
             # Fall through: escape the reserved prefix by double-encoding the literal.
