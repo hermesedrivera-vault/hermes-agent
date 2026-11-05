@@ -144,6 +144,16 @@ Every former god file is a **facade** (public entry points + the names other pac
   change-detectors or source-reading tests; host-specific behaviour is tested on that host with
   `@pytest.mark.platforms(...)`, never by faking `sys.platform`; tests never write to `~/.hermes/`.
   Everything else: `tests/AGENTS.md`.
+- **Code changes happen in a worktree branch, never the live checkout** (`git worktree add
+  /tmp/<name> <base>`); the live checkout only ever changes via a reviewed `git merge --ff-only`
+  of a tested branch tip, restarted by the human from outside the gateway process afterward.
+  Branch/checkout/reset/rebase against the live tree is blocked by tooling for exactly this reason
+  (2026-11-05, after a budget-exhaustion block left an edit in an unverified state).
+- **Reserve tool-call budget before starting an edit.** Don't begin a patch/write unless the
+  remaining budget covers edit + verify (doctor/tests) + commit-or-revert — at least 4 calls. If it
+  doesn't, stop and say so before touching a file, not after (2026-11-05 lesson: a patch call that
+  itself gets budget-blocked can leave ambiguous state that then needs a separate turn just to
+  confirm nothing landed).
 
 ## Routing Table — working in X → read X/AGENTS.md
 
