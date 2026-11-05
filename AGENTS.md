@@ -152,6 +152,12 @@ Every former god file is a **facade** (public entry points + the names other pac
   outside the gateway process afterward. Branch/checkout/reset/rebase against the live tree is
   blocked by tooling for exactly this reason (2026-11-05, after a budget-exhaustion block left an
   edit in an unverified state).
+  **Run tests from a plain clone outside `~/.hermes`, never from the worktree itself**
+  (`git clone <live-checkout> -b <branch> /tmp/<name>-test`): a worktree's `.git` dir physically
+  nests under the live checkout's `.git/worktrees/<name>/`, which trips `tests/home_io_guard.py`'s
+  "real hermes home" path match on completely unrelated tests (confirmed 2026-11-05: 237 spurious
+  `context_compressor` failures and 50 spurious `hermes_state` failures, both 0 on a plain clone of
+  the identical commit — edit in the worktree, verify from the clone).
 - **Reserve tool-call budget before starting an edit.** Don't begin a patch/write unless the
   remaining budget covers edit + verify (doctor/tests) + commit-or-revert — at least 4 calls. If it
   doesn't, stop and say so before touching a file, not after (2026-11-05 lesson: a patch call that
