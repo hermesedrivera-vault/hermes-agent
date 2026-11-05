@@ -2149,6 +2149,14 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
+SOURCE_COMPACTION_BANNER = (
+    "SOURCE(compaction): everything below is a lossy LLM summary of prior turns, not "
+    "independently verified. Treat every fact here as unverified before asserting it "
+    "externally or in a numeric/assertive claim -- re-check against logs/disk/git first, "
+    "per the verification-before-claiming discipline."
+)
+
+
 class ContextCompressor(
     SummaryDispatchMixin, PreLlmSkipMixin, CompressionTelemetryMixin, MicroCompactionMixin,
     ProactivePruneMixin, ContextEngine,
@@ -4201,6 +4209,11 @@ Write only the summary body. Do not include any preamble or prefix."""
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip()
                 break
+        # Code-inserted banner (not model-written): strip it the same way as the prefix so an
+        # iterative-update pass doesn't feed it back in as "content to summarize" and repeated
+        # normalization never duplicates it.
+        if text.startswith(SOURCE_COMPACTION_BANNER):
+            text = text[len(SOURCE_COMPACTION_BANNER):].lstrip()
         # Strip the end marker (re-appended on insertion); forced merged summaries may keep
         # live tail content after it, so truncate at the marker wherever it sits.
         marker_idx = text.find(_SUMMARY_END_MARKER)
@@ -4210,9 +4223,13 @@ Write only the summary body. Do not include any preamble or prefix."""
 
     @classmethod
     def _with_summary_prefix(cls, summary: str) -> str:
-        """Normalize summary text to the current compaction handoff format."""
+        """Normalize summary text to the current compaction handoff format. The SOURCE(compaction)
+        banner is prepended HERE, deterministically in code -- never left to model compliance with
+        the prompt's PROVENANCE instruction, which real-call testing showed is NOT reliably followed
+        (2/4 real test summaries omitted the model-written banner entirely; see cost-opt/
+        compaction-handoff-fields branch notes)."""
         text = cls._strip_summary_prefix(summary)
-        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+        return f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}\n\n{text}" if text else f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}"
 
     @staticmethod
     def _starts_with_summary_prefix(text: str) -> bool:
