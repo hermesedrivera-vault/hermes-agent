@@ -2149,6 +2149,14 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
+SOURCE_COMPACTION_BANNER = (
+    "SOURCE(compaction): everything below is a lossy LLM summary of prior turns, not "
+    "independently verified. Treat every fact here as unverified before asserting it "
+    "externally or in a numeric/assertive claim -- re-check against logs/disk/git first, "
+    "per the verification-before-claiming discipline."
+)
+
+
 class ContextCompressor(
     SummaryDispatchMixin, PreLlmSkipMixin, CompressionTelemetryMixin, MicroCompactionMixin,
     ProactivePruneMixin, ContextEngine,
@@ -4048,7 +4056,9 @@ Be specific with file paths, commands, line numbers, and results.]
 
 ## Active State
 [Current working state — include:
-- Working directory and branch (if applicable)
+- Working directory, active branch name, and the exact last commit SHA (short form is fine, but
+  include it — "on a feature branch" without the SHA is not enough to resume cold); note any
+  UNCOMMITTED changes explicitly, they are easy to lose across a handoff
 - Modified/created files with brief note on each
 - Test status (X/Y passing)
 - Any running processes or servers
@@ -4056,6 +4066,12 @@ Be specific with file paths, commands, line numbers, and results.]
 
 ## Blocked
 [Any blockers, errors, or issues not yet resolved. Include exact error messages.]
+
+## Pending Approvals
+[Anything awaiting an explicit yes/no from the user that has NOT yet been given. Call these out
+explicitly and separately from "Blocked" — a pending approval is a decision point, not a failure.
+State exactly what was proposed and what response (if any) is still needed. Only write "None" if
+every proposal in this window was explicitly approved, rejected, or withdrawn.]
 
 ## Key Decisions
 [Important technical decisions and WHY they were made]
@@ -4081,6 +4097,8 @@ or describe them. These markers tell the agent which skills must be reloaded bef
 use. If none appear, omit this section entirely.]
 
 Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+NUMERIC VERBATIM RULE: every dollar amount, tax total, token/byte count, commit SHA, and ID number that appears in the turns below must be copied into the summary EXACTLY as written — do not round, approximate, reformat, or paraphrase a number. If a figure's precision matters enough to appear at all, it matters enough to appear unchanged.
+PROVENANCE: this entire summary is SOURCE(compaction) — a lossy LLM pass over prior turns, not independently verified. Anyone reading it (including the agent itself in a later turn) must treat every fact here as unverified before asserting it externally, using it in a numeric/assertive claim, or acting on it — re-check against logs/disk/git first, per the verification-before-claiming discipline.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -4191,6 +4209,11 @@ Write only the summary body. Do not include any preamble or prefix."""
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip()
                 break
+        # Code-inserted banner (not model-written): strip it the same way as the prefix so an
+        # iterative-update pass doesn't feed it back in as "content to summarize" and repeated
+        # normalization never duplicates it.
+        if text.startswith(SOURCE_COMPACTION_BANNER):
+            text = text[len(SOURCE_COMPACTION_BANNER):].lstrip()
         # Strip the end marker (re-appended on insertion); forced merged summaries may keep
         # live tail content after it, so truncate at the marker wherever it sits.
         marker_idx = text.find(_SUMMARY_END_MARKER)
@@ -4200,9 +4223,13 @@ Write only the summary body. Do not include any preamble or prefix."""
 
     @classmethod
     def _with_summary_prefix(cls, summary: str) -> str:
-        """Normalize summary text to the current compaction handoff format."""
+        """Normalize summary text to the current compaction handoff format. The SOURCE(compaction)
+        banner is prepended HERE, deterministically in code -- never left to model compliance with
+        the prompt's PROVENANCE instruction, which real-call testing showed is NOT reliably followed
+        (2/4 real test summaries omitted the model-written banner entirely; see cost-opt/
+        compaction-handoff-fields branch notes)."""
         text = cls._strip_summary_prefix(summary)
-        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+        return f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}\n\n{text}" if text else f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}"
 
     @staticmethod
     def _starts_with_summary_prefix(text: str) -> bool:
@@ -5386,6 +5413,31 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Rewritten content: drop the stale api_content sidecar so replay can't resend pre-merge bytes.
         drop_stale_api_content(msg)
 
+    def _log_compaction_event(self, tokens_before: int, tokens_after: int) -> None:
+        """Best-effort additive line to the per-call cache log (cost-optimization project,
+        Phase 3): one JSON row per compaction event so threshold-change savings and
+        summary-fidelity issues can be verified from real data instead of estimated.
+        Never raises; must not affect the compression path it observes."""
+        try:
+            import json as _json
+            from hermes_constants import get_hermes_home
+            _summary_chars = len(getattr(self, "_previous_summary", "") or "")
+            log_dir = get_hermes_home() / "cost-tracking"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "cache_call_log.jsonl"
+            with contextlib.suppress(OSError):
+                if log_path.stat().st_size > 20_000_000:
+                    log_path.replace(log_dir / "cache_call_log.jsonl.1")
+            with open(log_path, "a") as fh:
+                fh.write(_json.dumps({
+                    "event": "compaction", "timestamp": time.time(), "session_id": self._session_id,
+                    "model": self.model, "compression_count": self.compression_count,
+                    "tokens_before": tokens_before, "tokens_after": tokens_after,
+                    "summary_tokens_estimate": _summary_chars // 4,
+                }) + "\n")
+        except Exception:
+            logger.debug("compaction event log write failed (best-effort, non-fatal)", exc_info=True)
+
     def _finalize_compressed(
         self, compressed: list[dict[str, Any]], messages: list[dict[str, Any]], n_messages: int,
         spare_pending_images: bool, pruned_count: int = 0,
@@ -5417,6 +5469,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         if not self.quiet_mode:
             logger.info("Compressed: %d -> %d messages (~%d tokens saved, %.0f%%)", n_messages, len(compressed), saved_estimate, savings_pct)
             logger.info("Compression #%d complete", self.compression_count)
+        self._log_compaction_event(pre_estimate, pre_estimate - saved_estimate)
 
         # Invariant (#57491): no compacted message leaves compress() with a persistence marker.
         _strip_persistence_markers(compressed)

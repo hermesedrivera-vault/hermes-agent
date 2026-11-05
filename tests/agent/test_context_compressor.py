@@ -12,6 +12,7 @@ from unittest.mock import patch, MagicMock
 from agent.context_compressor import (
     ContextCompressor,
     HISTORICAL_TASK_HEADING,
+    SOURCE_COMPACTION_BANNER,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
     _PRUNE_MIN_CHARS,
@@ -884,7 +885,7 @@ class TestNonStringContent:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             summary = c._generate_summary(messages)
 
-        assert summary.startswith(f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n")
+        assert summary.startswith(f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}\n\n{HISTORICAL_TASK_HEADING}\n")
         assert "do something" in summary
         assert summary.endswith("plain summary text")
 
@@ -1813,11 +1814,19 @@ class TestAbortOnSummaryFailure:
 class TestSummaryPrefixNormalization:
     def test_legacy_prefix_is_replaced(self):
         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
-        assert summary == f"{SUMMARY_PREFIX}\ndid work"
+        assert summary == f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}\n\ndid work"
 
     def test_existing_new_prefix_is_not_duplicated(self):
         summary = ContextCompressor._with_summary_prefix(f"{SUMMARY_PREFIX}\ndid work")
-        assert summary == f"{SUMMARY_PREFIX}\ndid work"
+        assert summary == f"{SUMMARY_PREFIX}\n{SOURCE_COMPACTION_BANNER}\n\ndid work"
+
+    def test_existing_banner_is_not_duplicated(self):
+        # Re-normalizing an already-bannered summary (iterative update pass) must not
+        # double the banner or feed it back in as content to summarize.
+        once = ContextCompressor._with_summary_prefix("did work")
+        twice = ContextCompressor._with_summary_prefix(once)
+        assert twice == once
+        assert twice.count("SOURCE(compaction)") == 1
 
 
 class TestCompressWithClient:
