@@ -145,10 +145,13 @@ Every former god file is a **facade** (public entry points + the names other pac
   `@pytest.mark.platforms(...)`, never by faking `sys.platform`; tests never write to `~/.hermes/`.
   Everything else: `tests/AGENTS.md`.
 - **Code changes happen in a worktree branch, never the live checkout** (`git worktree add
-  /tmp/<name> <base>`); the live checkout only ever changes via a reviewed `git merge --ff-only`
-  of a tested branch tip, restarted by the human from outside the gateway process afterward.
-  Branch/checkout/reset/rebase against the live tree is blocked by tooling for exactly this reason
-  (2026-11-05, after a budget-exhaustion block left an edit in an unverified state).
+  /tmp/<name> <base>`); the live checkout only ever changes via a reviewed, tagged merge — tag the
+  current tip first (`git tag pre-merge-<name>-<timestamp>`) for an instant rollback point, then
+  `git merge --no-ff <tested-branch-tip>` (matches the standing reconciliation procedure; `--no-ff`
+  keeps the branch's history+tag visible instead of collapsing it) — restarted by the human from
+  outside the gateway process afterward. Branch/checkout/reset/rebase against the live tree is
+  blocked by tooling for exactly this reason (2026-11-05, after a budget-exhaustion block left an
+  edit in an unverified state).
 - **Reserve tool-call budget before starting an edit.** Don't begin a patch/write unless the
   remaining budget covers edit + verify (doctor/tests) + commit-or-revert — at least 4 calls. If it
   doesn't, stop and say so before touching a file, not after (2026-11-05 lesson: a patch call that
