@@ -370,12 +370,64 @@ class SessionUsageMixin:
         sess = dict(row) if (row is not None and not task) else {}
         counts = [v or 0 for v in (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)]
         now = time.time()
+        resolved_model = model or sess.get("model") or "unknown"
+        resolved_provider = billing_provider or sess.get("billing_provider") or ""
+        resolved_base_url = billing_base_url or sess.get("billing_base_url") or ""
+        resolved_mode = billing_mode or sess.get("billing_mode") or ""
+        self._log_percall_cache_sample(
+            conn, session_id=session_id, model=resolved_model, billing_provider=resolved_provider,
+            billing_base_url=resolved_base_url, billing_mode=resolved_mode, task=task,
+            cache_read_tokens=counts[2], cache_write_tokens=counts[3], now=now,
+        )
         conn.execute(_MODEL_USAGE_UPSERT_SQL, (
-            session_id, model or sess.get("model") or "unknown",
-            billing_provider or sess.get("billing_provider") or "",
-            billing_base_url or sess.get("billing_base_url") or "",
-            billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts,
+            session_id, resolved_model, resolved_provider, resolved_base_url, resolved_mode,
+            task or "", api_call_count or 0, *counts,
             float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now))
+
+    def _log_percall_cache_sample(
+        self, conn, *, session_id: str, model: str, billing_provider: str, billing_base_url: str,
+        billing_mode: str, task: str, cache_read_tokens: int, cache_write_tokens: int, now: float,
+    ) -> None:
+        """Best-effort, additive-only per-call cache-usage sample for cost analysis (Phase-2 TTL
+        rollout, 2026-11-05 — prompt_caching.cache_ttl flipped 5m -> auto). Appends one JSON line
+        per API call to ``~/.hermes/cost-tracking/cache_call_log.jsonl``: timestamp, model, session
+        source, cache_read/write tokens, the resolved TTL tier, and seconds since this exact
+        (session, model, provider, task) route was last seen. Purely observability — never raises,
+        never participates in pricing or the session_model_usage upsert it sits beside. Needed to
+        verify the auto-TTL change against our own per-call data instead of the aux-review code
+        comment's one-install 42% figure. Safe to delete this method and its call site to revert."""
+        try:
+            prev_row = conn.execute(
+                "SELECT last_seen FROM session_model_usage WHERE session_id=? AND model=? AND "
+                "billing_provider=? AND billing_base_url=? AND billing_mode=? AND task=?",
+                (session_id, model, billing_provider, billing_base_url, billing_mode, task or ""),
+            ).fetchone()
+            prev_seen = prev_row[0] if prev_row else None
+            seconds_since_prev = (now - prev_seen) if prev_seen else None
+            src_row = conn.execute("SELECT source FROM sessions WHERE id=?", (session_id,)).fetchone()
+            source = src_row[0] if src_row else None
+            try:
+                from agent.prompt_caching import auto_cache_ttl_for_source
+                ttl_tier = auto_cache_ttl_for_source(source)
+            except Exception:
+                ttl_tier = None
+            import json as _json
+            from hermes_constants import get_hermes_home
+            log_dir = get_hermes_home() / "cost-tracking"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "cache_call_log.jsonl"
+            with contextlib.suppress(OSError):
+                if log_path.stat().st_size > 20_000_000:  # 20MB cap, then rotate
+                    log_path.replace(log_dir / "cache_call_log.jsonl.1")
+            with open(log_path, "a") as fh:
+                fh.write(_json.dumps({
+                    "ts": now, "session_id": session_id, "model": model, "source": source,
+                    "task": task or "", "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens, "ttl_tier": ttl_tier,
+                    "seconds_since_prev_call": seconds_since_prev,
+                }) + "\n")
+        except Exception:
+            pass
 
     def record_auxiliary_usage(
         self, session_id: str, task: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
