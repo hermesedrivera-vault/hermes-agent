@@ -138,15 +138,14 @@ def test_tax_ssn_pattern_requires_card_in_body_and_attachment_name(tmp_env):
 
 
 # 4 -----------------------------------------------------------------------
-def test_from_ed_always_requires_card_even_when_otherwise_clean(tmp_env):
-    calls = []
-
-    def gate(payload):
-        calls.append(payload)
-        return {"approved": True, "outcome": "approved"}
-
-    _send(tmp_env, approval_gate=gate, from_account="ed")
-    assert "from_ed" in calls[-1]["reasons"]
+def test_from_ed_rejected_outright_no_card_no_credential(tmp_env):
+    """Minor fix (Ed's review, 11/9/26): from_account='ed' is rejected
+    outright -- no credential exists for ed.rivera@gmail.com on this box,
+    so a card for it is pointless (it can never be approved into a real
+    send). It must raise, not show a card."""
+    with pytest.raises(ValueError, match="from_account='ed'"):
+        _send(tmp_env, approval_gate=lambda p: pytest.fail("no card for from_account='ed'"),
+              from_account="ed")
 
 
 # 5 -----------------------------------------------------------------------
@@ -249,3 +248,52 @@ def test_approved_recipients_file_is_protected_from_direct_edit(tmp_path):
     # be swept in by basename -- this gate is deliberately narrow.
     clean = _protected_instruction_reason(str(unrelated), enabled=True, extra_patterns=extra_patterns)
     assert clean is None
+
+
+# Fix 1 (Ed's review, 11/9/26) -----------------------------------------------
+# "stranger@evil.com, ken@jnccpas.com" as a single `to` string passed the old
+# endswith() check because the WHOLE comma-joined string happens to end with
+# "@jnccpas.com". Each individual address must now be checked.
+def test_comma_joined_to_with_unapproved_first_address_requires_card(tmp_env):
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    _send(tmp_env, approval_gate=gate, to="stranger@evil.com, ken@jnccpas.com")
+    assert len(calls) == 1, "comma-joined to= with an unapproved address must card, not auto-send"
+    assert "unknown_recipient" in calls[-1]["reasons"]
+
+
+def test_display_name_wrapped_address_is_parsed_and_checked(tmp_env):
+    """'Ken Rosa <ken@jnccpas.com>' must parse to ken@jnccpas.com (approved,
+    auto-sends) -- display-name wrapping must not itself trigger a card, and
+    must not let a malicious realname hide a different address either."""
+    result, client = _send(
+        tmp_env, approval_gate=lambda p: pytest.fail("known recipient, display-name wrapped, must not card"),
+        to="Ken Rosa <ken@jnccpas.com>",
+    )
+    assert result["outcome"] == "sent"
+
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    _send(tmp_env, approval_gate=gate, to="Not Ken <stranger@evil.com>")
+    assert len(calls) == 1 and "unknown_recipient" in calls[-1]["reasons"]
+
+
+def test_mixed_approved_and_unapproved_cc_requires_card(tmp_env):
+    """A mix of one approved + one unapproved address in Cc, comma-joined
+    within a single list entry, must still card on the unapproved one."""
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    _send(tmp_env, approval_gate=gate, cc=["ken@jnccpas.com, stranger@evil.com"])
+    assert len(calls) == 1 and "unknown_recipient" in calls[-1]["reasons"]

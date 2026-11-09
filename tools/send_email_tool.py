@@ -21,6 +21,7 @@ import os
 import re
 import types
 from dataclasses import dataclass, field
+from email.utils import getaddresses
 from typing import Any, Callable, Optional, Sequence
 
 from tools.email_send_log import append_log_entry, count_today
@@ -123,6 +124,51 @@ def _all_recipients(to: str, cc: Optional[Sequence[str]], bcc: Optional[Sequence
     return [a.lower() for a in addrs if a]
 
 
+# Fix 1 (Ed's review, 11/9/26): "stranger@evil.com, ken@jnccpas.com" as a
+# single `to` string passed the old endswith() check because the WHOLE
+# comma-joined string happens to end with "@jnccpas.com" -- the unapproved
+# first address never got checked on its own. Parsing must happen per
+# individual address, using email.utils.getaddresses (the same RFC parser
+# the stdlib email package itself uses), and MUST be run against the
+# addresses as they actually ended up in the BUILT message's To/Cc/Bcc
+# headers -- not the raw input strings -- so a header-smuggling trick that
+# bypasses the input but not the header can't slip through either.
+def _parsed_addresses(header_value: Optional[str]) -> list[str]:
+    """Every individual address in a comma-joined header value, lowercased.
+
+    Raises ValueError if any parsed entry is not a single, well-formed
+    addr-spec (empty address, or a realname with no '@', etc.) -- callers
+    must treat that as "cannot verify this field is safe" and card it,
+    never guess which part was intended.
+    """
+    if not header_value:
+        return []
+    out = []
+    for realname, addr in getaddresses([header_value]):
+        addr = (addr or "").strip()
+        if not addr or "@" not in addr or addr.startswith("@") or addr.endswith("@"):
+            raise ValueError(f"unparsable address entry in header: {realname!r} {addr!r}")
+        out.append(addr.lower())
+    return out
+
+
+def _recipients_from_built_message(msg, bcc: Sequence[str]) -> list[str]:
+    """Recipients as they exist in the BUILT message's own headers (To, Cc),
+    plus Bcc (which build_message() never writes to a header deliberately --
+    Bcc entries are validated from the input list itself, individually
+    parsed the same way, since there is no header to re-derive them from).
+    """
+    recipients: list[str] = []
+    try:
+        recipients += _parsed_addresses(msg.get("To"))
+        recipients += _parsed_addresses(msg.get("Cc"))
+    except ValueError:
+        raise
+    for addr in bcc or []:
+        recipients += _parsed_addresses(addr)
+    return recipients
+
+
 def _default_approval_gate(payload: dict) -> dict:
     """Production default: escalate to the real in-process human-approval gate
     (tools.approval.request_tool_approval), which already implements fail-closed-
@@ -189,8 +235,31 @@ def send_email(
     approved = _load_approved_list(approved_list_path)
     reasons: list[str] = []
 
-    # Change 1: every recipient field checked independently.
-    recipients = _all_recipients(to, cc, bcc)
+    # Build the real message FIRST (never sent yet -- build_message() only
+    # constructs the MIME object) so every downstream check inspects the
+    # recipients as they actually ended up in the message, not the raw
+    # inputs (Fix 1: a header-smuggling/comma-joined-string trick that
+    # fools a check on the input string must still be caught against the
+    # built headers).
+    args = types.SimpleNamespace(
+        to=to, subject=subject, body_file=body_path, cc=cc, bcc=bcc,
+        attach=list(attachments or []), in_reply_to=None, references=None,
+    )
+    token = gmail_client.refresh_token() if gmail_client else enforced.refresh_token()
+    msg, cc_list = enforced.build_message(args, token)
+    if MANDATORY_CC not in cc_list:
+        raise RuntimeError("INTERNAL ERROR: mandatory CC missing -- refusing to send.")
+
+    # Change 1 / Fix 1: every recipient field checked independently, parsed
+    # from the built message's headers (To/Cc) plus the raw Bcc list (never
+    # written to a header). Any address that doesn't parse as exactly one
+    # well-formed addr-spec is treated the same as "unknown" -- fail closed,
+    # never guess which part of a malformed field was intended.
+    try:
+        recipients = _recipients_from_built_message(msg, bcc)
+    except ValueError:
+        recipients = []
+        reasons.append("unknown_recipient")
     unknown = [addr for addr in recipients if not _is_approved_recipient(addr, approved)]
     if unknown:
         reasons.append("unknown_recipient")
@@ -200,9 +269,16 @@ def send_email(
     if _text_has_tax_ssn_pattern(scan_text):
         reasons.append("tax_ssn_pattern")
 
-    # Sending from Ed's own account always requires a card.
+    # Minor fix (Ed's review, 11/9/26): from_account="ed" is not a card
+    # candidate -- there is no credential for ed.rivera@gmail.com on this
+    # box at all, so a card that could never be approved into an actual
+    # send is just noise. Reject outright, before any gate/log/send path.
     if from_account == "ed":
-        reasons.append("from_ed")
+        raise ValueError(
+            "send_email: from_account='ed' is rejected outright -- no credential exists "
+            "for ed.rivera@gmail.com on this box. There is no card to show for this; it "
+            "can never be approved into a real send."
+        )
 
     # Change 2: rate limit counted live from the append-only log, no counter file.
     sent_today = count_today(path=log_path)
@@ -241,15 +317,8 @@ def send_email(
         # approved -> fall through to the real send below.
 
     # The real send (auto-send path, or a card that was just approved).
-    args = types.SimpleNamespace(
-        to=to, subject=subject, body_file=body_path, cc=cc, bcc=bcc,
-        attach=list(attachments or []), in_reply_to=None, references=None,
-    )
-
-    token = gmail_client.refresh_token() if gmail_client else enforced.refresh_token()
-    msg, cc_list = enforced.build_message(args, token)
-    assert MANDATORY_CC in cc_list, "INTERNAL ERROR: mandatory CC missing -- refusing to send."
-
+    # msg/cc_list/token were already built above (Fix 1) -- re-using them
+    # means what got approved is exactly what gets sent, byte for byte.
     import base64
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     if gmail_client is not None:
