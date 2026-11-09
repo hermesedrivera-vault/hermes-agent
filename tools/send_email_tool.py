@@ -17,14 +17,18 @@ the two constants must be kept in sync, they cannot import from each other acros
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import subprocess
 import types
 from dataclasses import dataclass, field
 from email.utils import getaddresses, make_msgid
+from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from agent.redact import redact_registered_vault_values
+from agent.file_safety import get_read_block_error
 from tools.email_send_log import append_log_entry, count_today, read_entries
 
 CANONICAL_ENFORCED_GMAIL_PATH = os.path.realpath(
@@ -101,6 +105,114 @@ def _extract_attachment_text(path: str) -> Optional[str]:
         return None
     # Unsupported extension (e.g. .docx, .png): content genuinely unknown,
     # not "known to be empty" -- fail closed, same as an extraction error.
+def _load_allowed_dirs(profile_path: Optional[str] = None) -> list[str]:
+    """Load and return the list of allowed directories for body/attachment paths.
+    
+    Reads from the protected config file in the profile. Paths are returned as-is
+    (with ~ unexpanded); callers must expand and resolve them.
+    
+    Raises ValueError if the config file cannot be read or parsed.
+    """
+    # Try profile path first (for tests), then fall back to live profile
+    if profile_path is None:
+        profile_path = os.path.expanduser("~/.hermes")
+    
+    allowed_dirs_file = os.path.join(profile_path, "protected", "send_email_allowed_dirs.json")
+    
+    if not os.path.exists(allowed_dirs_file):
+        raise ValueError(f"Allowed dirs config not found at {allowed_dirs_file}")
+    
+    try:
+        with open(allowed_dirs_file, 'r') as f:
+            config = json.load(f)
+        allowed = config.get("allowed_dirs", [])
+        if not isinstance(allowed, list):
+            raise ValueError("allowed_dirs must be a list in config")
+        return allowed
+    except (json.JSONDecodeError, IOError) as e:
+        raise ValueError(f"Failed to load allowed dirs config: {e}")
+
+
+def _is_path_allowed(path: str, allowed_dirs: list[str]) -> bool:
+    """Check if a path is under one of the allowed directories.
+    
+    Paths are resolved (symlinks followed, ~/ expanded, made absolute).
+    Returns True if the resolved path is inside one of the resolved allowed_dirs.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        for allowed_dir in allowed_dirs:
+            allowed_resolved = Path(allowed_dir).expanduser().resolve()
+            # Check if resolved is under allowed_resolved (is_relative_to)
+            try:
+                resolved.relative_to(allowed_resolved)
+                return True
+            except ValueError:
+                # Not under this directory, continue
+                continue
+        return False
+    except (OSError, RuntimeError):
+        return False
+
+
+def _check_content_for_secrets(text: str) -> Optional[str]:
+    """Scan text content against registered vault secrets.
+    
+    Returns an error message if secrets are detected, None if safe.
+    Uses the vault redaction registry's own redaction function to detect matches.
+    """
+    if not text:
+        return None
+    
+    # Apply the redaction function - if it changes the text, secrets were found
+    redacted = redact_registered_vault_values(text)
+    if redacted != text:
+        return "Content contains registered secret values (detected during redaction scan)"
+    
+    return None
+
+
+def _validate_path_and_content(path: str, allowed_dirs: list[str], is_attachment: bool = False) -> Optional[str]:
+    """Validate a file path for send_email (body_path or attachment).
+    
+    Checks:
+    1. Path is inside one of allowed_dirs (with ~ expansion and resolution)
+    2. Path is not blocked by get_read_block_error() (Hermes credential/cache files)
+    3. File content does not contain registered vault secrets
+    
+    Returns an error message if validation fails, None if path is safe.
+    """
+    # Step 1: Check path is in allowed dirs
+    if not _is_path_allowed(path, allowed_dirs):
+        return f"Path is not in allowed directories: {path}"
+    
+    # Step 2: Check file_safety blocklist (Hermes protected files)
+    resolved = Path(path).expanduser().resolve()
+    block_error = get_read_block_error(str(resolved))
+    if block_error:
+        return f"Path is blocked: {block_error}"
+    
+    # Step 3: Read and scan content for secrets
+    try:
+        with open(resolved, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except (OSError, IOError) as e:
+        return f"Cannot read file: {e}"
+    
+    # For attachments, try to extract text if it's not plain text
+    if is_attachment:
+        extracted = _extract_attachment_text(str(resolved))
+        if extracted is None and not str(resolved).lower().endswith(('.txt', '.csv', '.md', '.html', '.htm', '.log')):
+            # Attachment type but no text extraction - check if this is expected
+            pass  # Extraction failure is OK for unsupported types
+        if extracted is not None:
+            content = extracted
+    
+    # Scan content for secrets
+    secret_error = _check_content_for_secrets(content)
+    if secret_error:
+        return secret_error
+    
     return None
 
 
@@ -304,6 +416,24 @@ def send_email(
 
     cc = list(cc or [])
     bcc = list(bcc or [])
+
+    # Fix 1 (Critical exfiltration): Validate body_path and all attachments
+    # are within allowed directories and don't contain secrets before reading
+    try:
+        allowed_dirs = _load_allowed_dirs()
+    except ValueError as e:
+        return {"error": f"Path validation failed: {e}", "sent": False}
+    
+    # Validate body_path
+    path_error = _validate_path_and_content(body_path, allowed_dirs, is_attachment=False)
+    if path_error:
+        return {"error": f"Body path rejected: {path_error}", "sent": False, "blocked": True}
+    
+    # Validate all attachments
+    for attachment_path in (attachments or []):
+        path_error = _validate_path_and_content(attachment_path, allowed_dirs, is_attachment=True)
+        if path_error:
+            return {"error": f"Attachment rejected ({attachment_path}): {path_error}", "sent": False, "blocked": True}
 
     with open(body_path, encoding="utf-8") as f:
         body_text = f.read()
