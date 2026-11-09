@@ -120,7 +120,7 @@ def test_unknown_recipient_in_any_field_requires_card(tmp_env):
 
 
 # 3 -----------------------------------------------------------------------
-def test_tax_ssn_pattern_requires_card_in_body_and_attachment_name(tmp_env):
+def test_ssn_shaped_pattern_requires_card_in_body_and_attachment_name(tmp_env):
     calls = []
 
     def gate(payload):
@@ -128,13 +128,43 @@ def test_tax_ssn_pattern_requires_card_in_body_and_attachment_name(tmp_env):
         return {"approved": True, "outcome": "approved"}
 
     ssn_body = tmp_env.body_path.replace("body.txt", "body_ssn.txt")
-    Path(ssn_body).write_text("Ken, Ed's SSN is 123-45-6789, please file his 1040.")
+    Path(ssn_body).write_text("Ken, Ed's SSN is 123-45-6789, please file his return.")
     _send(tmp_env, approval_gate=gate, body_path=ssn_body)
     assert "tax_ssn_pattern" in calls[-1]["reasons"]
 
     calls.clear()
     _send(tmp_env, approval_gate=gate, attachments=["RIVERA_ED_2025.pdf"])
     assert "tax_ssn_pattern" in calls[-1]["reasons"]
+
+
+# Tax decision (Ed, 11/9/26) -- negative tests -----------------------------
+def test_tax_words_alone_do_not_require_a_card(tmp_env):
+    """'tax return', '1099', 'W-2', 'Form 1040' with no SSN-shaped number and
+    no JNC file-name match must auto-send -- tax vocabulary alone is never a
+    trigger (regression guard against over-triggering on routine mail)."""
+    words_body = tmp_env.body_path.replace("body.txt", "body_words.txt")
+    Path(words_body).write_text(
+        "Ken, can you confirm the 1099 and W-2 are ready, and whether the "
+        "Form 1040 tax return needs anything else from me? Thanks, Ed."
+    )
+    result, client = _send(
+        tmp_env, approval_gate=lambda p: pytest.fail("tax vocabulary alone must not card"),
+        body_path=words_body,
+    )
+    assert result["outcome"] == "sent"
+
+
+def test_bare_nine_digits_with_no_ssn_label_do_not_require_a_card(tmp_env):
+    """A bare 9-digit run with no adjacent SSN/ITIN/EIN/TIN label (e.g. a
+    tracking or account number) must auto-send -- _TAX_CONTEXT_RE's
+    adjacency requirement is what prevents this false positive."""
+    nums_body = tmp_env.body_path.replace("body.txt", "body_nums.txt")
+    Path(nums_body).write_text("Ken, the tracking number for the mailed documents is 123456789.")
+    result, client = _send(
+        tmp_env, approval_gate=lambda p: pytest.fail("bare 9 digits with no label must not card"),
+        body_path=nums_body,
+    )
+    assert result["outcome"] == "sent"
 
 
 # 4 -----------------------------------------------------------------------

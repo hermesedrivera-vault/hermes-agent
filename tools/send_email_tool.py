@@ -35,12 +35,18 @@ DEFAULT_FROM_ACCOUNT_ADDRESS = "hermes.ed.rivera@gmail.com"
 MANDATORY_CC = "ed.rivera@gmail.com"
 DAILY_AUTO_SEND_LIMIT = 20
 
-# Change 4: tax/SSN pattern set. Applied to subject, body, AND attachment
-# names/content -- not just attachments (that was the pre-v3 gap).
+# Tax decision (Ed, 11/9/26): tax vocabulary ALONE -- "tax return", "1099",
+# "W-2", "Form 1040" -- must NOT trigger a card; those words are too common
+# in routine correspondence. Cards fire only on: an SSN-shaped number
+# (dashed, spaced, or a bare 9-digit run that sits next to an SSN/ITIN/TIN
+# label), or a JNC client file-name pattern, or either of those inside an
+# attachment's extracted text (see Fix 5). _TAX_CONTEXT_RE is used ONLY to
+# narrow the bare-9-digit case -- it is never itself a standalone trigger.
 _SSN_HYPHENATED_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_SSN_SPACED_RE = re.compile(r"\b\d{3}\s\d{2}\s\d{4}\b")
 _SSN_BARE_RE = re.compile(r"\b\d{9}\b")
 _TAX_CONTEXT_RE = re.compile(
-    r"\bSSN\b|\bITIN\b|\bEIN\b|form\s*1040|\btax\s*return\b|\bW-?2\b|\b1099\b",
+    r"\bSSN\b|\bITIN\b|\bEIN\b|\bTIN\b",
     re.I,
 )
 # JNC client-file naming pattern, e.g. "RIVERA_ED_2025" style tokens.
@@ -52,12 +58,15 @@ def _text_has_tax_ssn_pattern(text: str) -> bool:
         return False
     if _SSN_HYPHENATED_RE.search(text):
         return True
+    if _SSN_SPACED_RE.search(text):
+        return True
     if _JNC_CLIENT_FILE_RE.search(text):
         return True
-    if _TAX_CONTEXT_RE.search(text):
-        return True
-    # A bare 9-digit run is only SSN-shaped WITH tax context nearby (a plain
-    # phone/account number is not inherently sensitive on its own).
+    # A bare 9-digit run is only SSN-shaped when it sits next to an
+    # SSN/ITIN/EIN/TIN label -- a plain phone/account/tracking number is
+    # not inherently sensitive on its own, and tax vocabulary alone
+    # ("tax return", "1099", "Form 1040", ...) is deliberately NOT part of
+    # this check (Tax decision, 11/9/26).
     if _SSN_BARE_RE.search(text) and _TAX_CONTEXT_RE.search(text):
         return True
     return False
