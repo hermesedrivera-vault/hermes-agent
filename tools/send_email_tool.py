@@ -238,76 +238,7 @@ def _recipients_from_built_message(msg, bcc: Sequence[str]) -> list[str]:
     return recipients
 
 
-def request_once_only_approval(description: str, display: str, pattern_key: str) -> dict:
-    """Fix 4 (Ed's review, 11/9/26): the SAME once-only gateway/CLI path the
-    protected-instruction-file write gate uses
-    (tools/file_tools_write_guards.py:_request_protected_instruction_approval,
-    live-verified 11/1/26 against Ed's Telegram -- a denied kenneth-rosa
-    config.yaml write and this morning's outbound_classify.py cards both
-    went through this exact code shape). allow_permanent=False,
-    allow_session=False throughout: the card offers only Approve once / Deny,
-    never a persisted scope. Deliberately NOT routed through
-    request_tool_approval()/_run_approval_gate() -- neither has an
-    allow_session/allow_permanent knob, and extending the shared gate used
-    by every other tool was explicitly ruled out (11/9/26: too large a
-    blast radius to verify in this pass).
-
-    Returns ``{"approved": bool, "outcome": ...}`` -- "outcome" is present
-    ONLY for a real human decision (approved/denied/timeout); its absence
-    is the gate-unreachable signal (no human/gateway channel at all),
-    matching ``_classify_gate_result``'s existing contract.
-    """
-    try:
-        import tools.approval as _approval
-        from tools.approval_context import get_current_session_key, _no_user_can_answer, _fire_approval_hook
-        from tools.approval_gateway_wait import _await_gateway_decision
-        from tools.approval_prompt import prompt_dangerous_approval
-    except Exception:
-        return {"approved": False}  # gate_unreachable: approval subsystem unavailable
-
-    session_key = get_current_session_key()
-    try:
-        with _approval._lock:
-            notify_cb = _approval._gateway_notify_cbs.get(session_key)
-    except Exception:
-        notify_cb = None
-
-    if notify_cb is not None:
-        # Gateway surface (Telegram/desktop card): block on the button
-        # round-trip. One-operation only -- no scope buttons offered.
-        approval_data = {
-            "command": display, "pattern_key": pattern_key, "pattern_keys": [pattern_key],
-            "description": description, "allow_permanent": False, "allow_session": False,
-        }
-        decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
-        if decision.get("notify_failed") or decision.get("cancelled"):
-            return {"approved": False}  # gate_unreachable: card could not be delivered/was withdrawn
-        choice, timed = decision.get("choice"), not decision.get("resolved")
-    else:
-        # CLI surface: per-thread approval callback (prompt_toolkit panel).
-        try:
-            from tools.terminal_tool import _get_approval_callback
-            callback = _get_approval_callback()
-        except Exception:
-            callback = None
-        if callback is None or _no_user_can_answer():
-            return {"approved": False}  # gate_unreachable: no human channel present
-        hook_kwargs = dict(command=display, description=description, pattern_key=pattern_key,
-                           pattern_keys=[pattern_key], session_key=session_key, surface="cli")
-        _fire_approval_hook("pre_approval_request", **hook_kwargs)
-        choice = prompt_dangerous_approval(
-            display, description, allow_permanent=False, allow_session=False, approval_callback=callback)
-        _fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
-        if choice == "cancelled":
-            return {"approved": False}  # gate_unreachable: prompt never reached a human
-        timed = choice == "timeout"
-
-    # Any tapped scope is a one-operation grant; nothing is persisted. (The
-    # UI only ever offers once/deny here, but this mirrors the proven
-    # protected-instruction gate's own defensive handling exactly.)
-    if not timed and choice in {"once", "session", "always"}:
-        return {"approved": True, "outcome": "approved"}
-    return {"approved": False, "outcome": "timeout" if timed else "denied"}
+from tools.once_only_approval import request_once_only_approval
 
 
 def _once_only_approval_gate(payload: dict) -> dict:
