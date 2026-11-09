@@ -22,7 +22,7 @@ import re
 import subprocess
 import types
 from dataclasses import dataclass, field
-from email.utils import getaddresses
+from email.utils import getaddresses, make_msgid
 from typing import Any, Callable, Optional, Sequence
 
 from tools.email_send_log import append_log_entry, count_today
@@ -292,6 +292,19 @@ def send_email(
     if MANDATORY_CC not in cc_list:
         raise RuntimeError("INTERNAL ERROR: mandatory CC missing -- refusing to send.")
 
+    # Fix 6 (Ed's review, 11/9/26): set the RFC Message-Id header OURSELVES,
+    # before sending, rather than relying on Gmail's internal message "id"
+    # (messages.send's response "id" is NOT the RFC Message-Id header, and
+    # the email platform adapter -- a second real send path into the same
+    # mailbox -- has no Gmail "id" at all, only an RFC Message-Id it set
+    # itself via smtplib). The send log and the digest's SENT-vs-log
+    # cross-check both key on this RFC header so both paths compare
+    # apples to apples; see tools/email_send_log.py and
+    # scripts/send_email_digest.py.
+    if not msg.get("Message-Id"):
+        msg["Message-Id"] = make_msgid(domain="hermes.ed.rivera.gmail.com")
+    rfc_message_id = msg["Message-Id"]
+
     # Change 1 / Fix 1: every recipient field checked independently, parsed
     # from the built message's headers (To/Cc) plus the raw Bcc list (never
     # written to a header). Any address that doesn't parse as exactly one
@@ -343,11 +356,11 @@ def send_email(
 
     needs_card = bool(reasons)
 
-    def _log(outcome: str, message_id: Optional[str]) -> None:
+    def _log(outcome: str, message_id: Optional[str], gmail_id: Optional[str] = None) -> None:
         append_log_entry({
-            "message_id": message_id, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
-            "bcc": [a.lower() for a in bcc], "subject": subject, "from_account": from_account,
-            "source": "send_email", "outcome": outcome, "reasons": reasons,
+            "message_id": message_id, "gmail_id": gmail_id, "to": (to or "").lower(),
+            "cc": [a.lower() for a in cc], "bcc": [a.lower() for a in bcc], "subject": subject,
+            "from_account": from_account, "source": "send_email", "outcome": outcome, "reasons": reasons,
         }, path=log_path)
 
     if needs_card:
@@ -373,16 +386,17 @@ def send_email(
         # approved -> fall through to the real send below.
 
     # The real send (auto-send path, or a card that was just approved).
-    # msg/cc_list/token were already built above (Fix 1) -- re-using them
-    # means what got approved is exactly what gets sent, byte for byte.
+    # msg/cc_list/token/rfc_message_id were already built above (Fix 1/6) --
+    # re-using them means what got approved is exactly what gets sent, byte
+    # for byte, with the Message-Id header already fixed.
     import base64
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     if gmail_client is not None:
         result = gmail_client.send(raw, None, token)
     else:
         result = enforced.gmail_send(raw, None, token)
-    message_id = result["id"]
+    gmail_id = result["id"]
 
-    _log("sent", message_id)
-    return SendEmailResult(outcome="sent", sent=True, message_id=message_id, reasons=reasons,
+    _log("sent", rfc_message_id, gmail_id=gmail_id)
+    return SendEmailResult(outcome="sent", sent=True, message_id=rfc_message_id, reasons=reasons,
                             detail="sent").to_dict()

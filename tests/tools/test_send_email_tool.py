@@ -364,3 +364,21 @@ def test_attachment_extraction_failure_requires_card(tmp_env):
     _send(tmp_env, approval_gate=gate, attachments=["unreadable.pdf"],
           attachment_text_extractor=failing_extractor)
     assert "attachment_extraction_failed" in calls[-1]["reasons"]
+
+
+# Fix 6 (Ed's review, 11/9/26) -- RFC Message-Id, not Gmail's internal id ---
+def test_logged_message_id_is_rfc_header_not_gmail_internal_id(tmp_env):
+    """The digest cross-checks send_email() against the email adapter by
+    Message-Id -- the adapter only ever has an RFC header, never a Gmail
+    internal id. send_email() must log the RFC Message-Id header as
+    'message_id' (Gmail's internal id goes in a separate 'gmail_id' field),
+    or every adapter reply would show up as a false bypass alert."""
+    result, client = _send(tmp_env)
+    assert result["outcome"] == "sent"
+    assert result["message_id"].startswith("<") and result["message_id"].endswith(">"), \
+        "message_id must be an RFC Message-Id header (<...@...>), not Gmail's bare internal id"
+    assert result["message_id"] != client.sent[0]["id"], \
+        "message_id must not be Gmail's internal send-result id"
+    logged = list(read_entries(path=tmp_env.log_path))
+    assert logged[-1]["message_id"] == result["message_id"]
+    assert logged[-1]["gmail_id"] == client.sent[0]["id"]
