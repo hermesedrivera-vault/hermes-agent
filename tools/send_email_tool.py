@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
 import types
 from dataclasses import dataclass, field
 from email.utils import getaddresses
@@ -70,6 +71,37 @@ def _text_has_tax_ssn_pattern(text: str) -> bool:
     if _SSN_BARE_RE.search(text) and _TAX_CONTEXT_RE.search(text):
         return True
     return False
+
+
+# Fix 5 (Ed's review, 11/9/26): the pre-fix scan only ever looked at
+# attachment FILE NAMES, never their content -- a client's SSN sitting
+# inside a PDF's text would never be caught. Extraction failure (missing
+# binary, corrupt file, unsupported/unreadable type) must be treated as
+# "content unknown" and force a card, never silently skipped.
+_EXTRACTABLE_TEXT_SUFFIXES = (".txt", ".csv", ".md", ".html", ".htm", ".log")
+
+
+def _extract_attachment_text(path: str) -> Optional[str]:
+    """Best-effort text extraction for one attachment. Returns the extracted
+    text, or None if extraction could not be performed/trusted. Callers MUST
+    treat None as "content unknown" (force a card), never as "no content"."""
+    lower = path.lower()
+    try:
+        if lower.endswith(_EXTRACTABLE_TEXT_SUFFIXES):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read()
+        if lower.endswith(".pdf"):
+            result = subprocess.run(
+                ["pdftotext", path, "-"], capture_output=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.decode("utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Unsupported extension (e.g. .docx, .png): content genuinely unknown,
+    # not "known to be empty" -- fail closed, same as an extraction error.
+    return None
 
 
 class GateUnreachableError(Exception):
@@ -218,6 +250,7 @@ def send_email(
     log_path: Optional[str] = None,
     approved_list_path: Optional[str] = None,
     enforced_module: Optional[types.ModuleType] = None,
+    attachment_text_extractor: Optional[Callable[[str], Optional[str]]] = None,
 ) -> dict:
     """Send one email, enforcing every v3 policy check before any real send.
 
@@ -273,8 +306,22 @@ def send_email(
     if unknown:
         reasons.append("unknown_recipient")
 
-    # Change 4: subject + body + attachment names scanned (not just attachment content).
-    scan_text = "\n".join([subject or "", body_text] + list(attachments or []))
+    # Change 4 / Fix 5: subject + body + attachment NAMES + attachment
+    # CONTENT (extracted text) all scanned. Extraction failure for any
+    # attachment forces a card -- "content unknown" is never treated the
+    # same as "content clean".
+    extract = attachment_text_extractor or _extract_attachment_text
+    attachment_texts: list[str] = []
+    extraction_failed: list[str] = []
+    for path in (attachments or []):
+        extracted = extract(path)
+        if extracted is None:
+            extraction_failed.append(path)
+        else:
+            attachment_texts.append(extracted)
+    if extraction_failed:
+        reasons.append("attachment_extraction_failed")
+    scan_text = "\n".join([subject or "", body_text] + list(attachments or []) + attachment_texts)
     if _text_has_tax_ssn_pattern(scan_text):
         reasons.append("tax_ssn_pattern")
 

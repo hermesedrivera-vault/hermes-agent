@@ -327,3 +327,40 @@ def test_mixed_approved_and_unapproved_cc_requires_card(tmp_env):
 
     _send(tmp_env, approval_gate=gate, cc=["ken@jnccpas.com, stranger@evil.com"])
     assert len(calls) == 1 and "unknown_recipient" in calls[-1]["reasons"]
+
+
+# Fix 5 (Ed's review, 11/9/26) -- attachment CONTENT scanning --------------
+def test_attachment_content_ssn_requires_card(tmp_env):
+    """An attachment whose NAME is clean but whose extracted CONTENT has an
+    SSN-shaped number must still card (extractor test seam, no real PDF
+    needed)."""
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    def fake_extractor(path):
+        assert path == "clean_name.pdf"
+        return "Client SSN on file: 123-45-6789"
+
+    _send(tmp_env, approval_gate=gate, attachments=["clean_name.pdf"],
+          attachment_text_extractor=fake_extractor)
+    assert "tax_ssn_pattern" in calls[-1]["reasons"]
+
+
+def test_attachment_extraction_failure_requires_card(tmp_env):
+    """If extraction fails (corrupt file, missing binary, unsupported type),
+    content is UNKNOWN -- that must force a card, never a silent auto-send."""
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    def failing_extractor(path):
+        return None
+
+    _send(tmp_env, approval_gate=gate, attachments=["unreadable.pdf"],
+          attachment_text_extractor=failing_extractor)
+    assert "attachment_extraction_failed" in calls[-1]["reasons"]
