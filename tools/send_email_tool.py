@@ -447,6 +447,41 @@ def send_email(
     # inputs (Fix 1: a header-smuggling/comma-joined-string trick that
     # fools a check on the input string must still be caught against the
     # built headers).
+    # Fix 2: Verify signature/body/HTML checks BEFORE building the message.
+    # These checks are called inside enforced.build_message() but test stubs may
+    # skip them. We run them here explicitly to ensure they always fire.
+    # Check 1: Body is not empty/whitespace-only
+    if not body_text.strip():
+        reasons.append("empty_body")
+        return SendEmailResult(
+            outcome="denied", sent=False, reasons=reasons,
+            detail="Body is empty (or whitespace-only). This is the exact failure mode from "
+                   "the 2026-08-09 empty-body incident. Refusing.",
+        ).to_dict()
+
+    # Check 2: HTML bodies must have required formatting markers (justified + 1.5 line-height)
+    if body_path.lower().endswith((".html", ".htm")):
+        REQUIRED_HTML_MARKERS = ["text-align: justify", "line-height: 1.5"]
+        missing = [m for m in REQUIRED_HTML_MARKERS if m not in body_text]
+        if missing:
+            reasons.append("missing_html_formatting")
+            return SendEmailResult(
+                outcome="denied", sent=False, reasons=reasons,
+                detail=f"HTML body missing required formatting marker(s): {missing}. "
+                       "Every external send must use justified paragraphs (text-align: justify) "
+                       "with 0.5 line spacing (line-height: 1.5). Rebuild with house HTML template.",
+            ).to_dict()
+
+    # Check 3: Validate signature is present (Hermes Trismegistos (Ed's AI assistant))
+    REQUIRED_SIGNATURE = "Hermes Trismegistos (Ed's AI assistant)"
+    if REQUIRED_SIGNATURE not in body_text:
+        reasons.append("missing_signature")
+        return SendEmailResult(
+            outcome="denied", sent=False, reasons=reasons,
+            detail=f"Body must include the signature '{REQUIRED_SIGNATURE}'. "
+                   "This is Ed's standing policy for every external send.",
+        ).to_dict()
+
     args = types.SimpleNamespace(
         to=to, subject=subject, body_file=body_path, cc=cc, bcc=bcc,
         attach=list(attachments or []), in_reply_to=None, references=None,
@@ -602,6 +637,62 @@ def send_email(
             detail="draft hash changed between approval and send -- refusing to send what was "
                    "never actually approved.",
         ).to_dict()
+
+    # Fix 3a: Second duplicate-hash check RIGHT BEFORE the real send call.
+    # Between the first check (before approval card) and now, something could have
+    # been logged with this same hash by another process/thread. Re-verify.
+    already_sent_now = any(
+        e.get("draft_hash") == draft_hash and e.get("outcome") == "sent"
+        for e in read_entries(path=log_path)
+    )
+    if already_sent_now:
+        _log("denied", None)
+        return SendEmailResult(
+            outcome="denied", sent=False, reasons=reasons + ["duplicate_draft_hash_already_sent_pre_send"],
+            detail="this exact draft was already sent between approval check and send -- "
+                   "refusing duplicate send.",
+        ).to_dict()
+
+    # Fix 3b: Validate every To/Cc/Bcc address has exactly one '@' and valid addr-spec.
+    import re
+    email_regex = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
+    all_addresses_to_check = [to] + cc + bcc
+    for addr in all_addresses_to_check:
+        if not addr:
+            continue
+        addr = addr.strip()
+        # Count '@' symbols - must be exactly one
+        if addr.count("@") != 1:
+            reasons.append("invalid_email_format")
+            _log("denied", None)
+            return SendEmailResult(
+                outcome="denied", sent=False, reasons=reasons,
+                detail=f"Invalid email address (wrong '@' count): {addr}",
+            ).to_dict()
+        # Basic regex check for valid format
+        if not email_regex.match(addr):
+            reasons.append("invalid_email_format")
+            _log("denied", None)
+            return SendEmailResult(
+                outcome="denied", sent=False, reasons=reasons,
+                detail=f"Invalid email address format: {addr}",
+            ).to_dict()
+
+    # Fix 3c: Verify Bcc header is present in the raw MIME message before sending.
+    # Gmail's messages.send API requires the Bcc to be in the raw message itself
+    # (unlike raw SMTP which has a separate envelope-bcc parameter).
+    raw_message_bytes = msg.as_bytes()
+    raw_message_str = raw_message_bytes.decode('utf-8', errors='replace')
+    if bcc:
+        # Check that the Bcc header is in the raw message (verify before encoding to base64)
+        has_bcc_header = any("Bcc:" in line for line in raw_message_str.split('\n'))
+        if not has_bcc_header:
+            reasons.append("bcc_header_missing")
+            _log("denied", None)
+            return SendEmailResult(
+                outcome="denied", sent=False, reasons=reasons,
+                detail=f"Bcc header not found in raw MIME message. Bcc delivery would fail.",
+            ).to_dict()
 
     # The real send (auto-send path, or a card that was just approved).
     # msg/cc_list/token/rfc_message_id were already built above (Fix 1/6) --

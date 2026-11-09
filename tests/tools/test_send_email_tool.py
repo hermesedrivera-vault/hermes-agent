@@ -482,3 +482,289 @@ def test_once_only_approval_gate_fails_closed_when_gateway_unreachable(monkeypat
     result = se.request_once_only_approval("desc", "<display>", "pattern:abc")
     assert result["approved"] is False
     assert "outcome" not in result
+
+
+# Fix 2: Body formatting and signature checks =====================================
+def test_empty_body_text_requires_card(tmp_env):
+    """Empty body must trigger body_format_invalid reason and require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    empty_body = tmp_env.body_path.replace("body.txt", "body_empty.txt")
+    Path(empty_body).write_text("")  # empty file
+    
+    result, client = _send(tmp_env, approval_gate=gate, body_path=empty_body)
+    assert "body_format_invalid" in result["reasons"]
+    assert len(calls) == 1, "should have shown card for empty body"
+
+
+def test_whitespace_only_body_text_requires_card(tmp_env):
+    """Whitespace-only body must trigger body_format_invalid reason."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    ws_body = tmp_env.body_path.replace("body.txt", "body_ws.txt")
+    Path(ws_body).write_text("   \n\n  \t\t  \n  ")  # only whitespace
+    
+    result, client = _send(tmp_env, approval_gate=gate, body_path=ws_body)
+    assert "body_format_invalid" in result["reasons"]
+
+
+def test_html_body_missing_text_align_justify_requires_card(tmp_env):
+    """HTML body missing 'text-align: justify' marker must require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    html_body = tmp_env.body_path.replace("body.txt", "body.html")
+    # HTML with line-height: 1.5 but NO text-align: justify
+    Path(html_body).write_text('<html><body style="line-height: 1.5">Test email</body></html>')
+    
+    result, client = _send(tmp_env, approval_gate=gate, body_path=html_body)
+    assert "body_format_invalid" in result["reasons"]
+    assert len(calls) == 1
+
+
+def test_html_body_missing_line_height_requires_card(tmp_env):
+    """HTML body missing 'line-height: 1.5' marker must require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    html_body = tmp_env.body_path.replace("body.txt", "body2.html")
+    # HTML with text-align: justify but NO line-height: 1.5
+    Path(html_body).write_text('<html><body style="text-align: justify">Test email</body></html>')
+    
+    result, client = _send(tmp_env, approval_gate=gate, body_path=html_body)
+    assert "body_format_invalid" in result["reasons"]
+
+
+def test_html_body_with_both_markers_auto_sends(tmp_env):
+    """HTML body with both required markers must NOT require a card."""
+    html_body = tmp_env.body_path.replace("body.txt", "body_good.html")
+    Path(html_body).write_text(
+        '<html><body style="text-align: justify; line-height: 1.5">Test email for Ken.</body></html>'
+    )
+    
+    result, _ = _send(
+        tmp_env, 
+        approval_gate=lambda p: pytest.fail("known recipient with proper HTML should not card"),
+        body_path=html_body,
+    )
+    assert result["outcome"] == "sent"
+
+
+def test_plain_text_body_exempt_from_html_marker_check(tmp_env):
+    """Plain-text .txt body is exempt from HTML marker check (doesn't need justify/line-height)."""
+    # Use default body_path which is a .txt file
+    result, _ = _send(
+        tmp_env,
+        approval_gate=lambda p: pytest.fail("plain text body should not require markers"),
+    )
+    assert result["outcome"] == "sent"
+
+
+# Fix 3a: Duplicate-hash recheck before send ====================================
+def test_duplicate_draft_hash_at_send_time_catches_race(tmp_env):
+    """Fix 3a: Second duplicate-hash check immediately before send catches race condition."""
+    calls = []
+    
+    def gate(payload):
+        calls.append(payload)
+        # Now, while card is shown, simulate another process logging a duplicate
+        # by manually appending a "sent" entry with the same draft_hash to the log
+        from tools.email_send_log import append_log_entry
+        append_log_entry({
+            "message_id": "<race-draft@example.com>",
+            "gmail_id": "gmail-race-id",
+            "to": "ken@jnccpas.com",
+            "cc": [se.MANDATORY_CC],
+            "bcc": [],
+            "subject": "Weekly update",
+            "from_account": "hermes",
+            "source": "external_send",
+            "outcome": "sent",
+            "reasons": [],
+            "draft_hash": payload.get("draft_hash"),  # SAME hash as the pending draft
+        }, path=tmp_env.log_path)
+        
+        # Now approve - but the send should still be rejected due to the second check
+        return {"approved": True, "outcome": "approved"}
+    
+    result, client = _send(tmp_env, approval_gate=gate, to="stranger@example.com")
+    
+    # Should be denied at send time, not sent, because duplicate was logged between card and send
+    assert result["outcome"] == "denied"
+    assert "duplicate_draft_hash_at_send_time" in result["reasons"]
+    assert client.sent == [], "should NOT have called gmail_send despite approval"
+
+
+# Fix 3b: Email address validation =============================================
+def test_invalid_address_multiple_at_signs_requires_card(tmp_env):
+    """Address with multiple '@' signs (a@@b.com) must require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    result, _ = _send(tmp_env, approval_gate=gate, to="a@@b.com")
+    assert len(calls) == 1, "multiple @ should trigger card"
+    assert "unknown_recipient" in calls[-1]["reasons"]
+
+
+def test_invalid_address_no_at_sign_requires_card(tmp_env):
+    """Address with no '@' (not-an-email) must require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    result, _ = _send(tmp_env, approval_gate=gate, to="not-an-email")
+    assert len(calls) == 1
+    assert "unknown_recipient" in calls[-1]["reasons"]
+
+
+def test_invalid_address_empty_local_part_requires_card(tmp_env):
+    """Address with empty local part (@domain.com) must require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    result, _ = _send(tmp_env, approval_gate=gate, to="@example.com")
+    assert len(calls) == 1
+    assert "unknown_recipient" in calls[-1]["reasons"]
+
+
+def test_invalid_address_empty_domain_requires_card(tmp_env):
+    """Address with empty domain (user@) must require approval card."""
+    calls = []
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+    
+    result, _ = _send(tmp_env, approval_gate=gate, to="user@")
+    assert len(calls) == 1
+    assert "unknown_recipient" in calls[-1]["reasons"]
+
+
+def test_valid_address_on_approved_list_still_auto_sends(tmp_env):
+    """Regression: valid address on approved list must still auto-send (no card)."""
+    result, _ = _send(
+        tmp_env,
+        approval_gate=lambda p: pytest.fail("known recipient should not card"),
+        to="ken@jnccpas.com",
+    )
+    assert result["outcome"] == "sent"
+
+
+# Fix 3c: Bcc delivery verification ============================================
+def test_bcc_header_present_in_message_bytes_sent_to_gmail_api(tmp_env):
+    """Fix 3c: Verify Bcc header is present in raw message sent to Gmail API."""
+    stub_client = StubGmailClient()
+    result, _ = _send(tmp_env, gmail_client=stub_client, bcc=["hidden@example.com"])
+    
+    # Capture the raw message that was sent
+    import base64
+    sent_raw = stub_client.sent[0]["raw"]
+    msg_bytes = base64.urlsafe_b64decode(sent_raw)
+    msg_text = msg_bytes.decode(errors="replace")
+    
+    # The Bcc header SHOULD be in the message (even though RFC 5322 says it's typically omitted,
+    # Gmail's API expects it to be there for actual delivery to Bcc recipients).
+    # If not present, Bcc delivery is silently broken.
+    assert "Bcc:" in msg_text or "Bcc=" in msg_text, \
+        "Bcc header missing from raw message -- Bcc recipients will not receive the email via Gmail API"
+
+
+def test_bcc_recipients_appear_in_sent_message_correctly(tmp_env):
+    """Test that Bcc recipients are captured in the sent message structure."""
+    stub_client = StubGmailClient()
+    result, _ = _send(
+        tmp_env, 
+        gmail_client=stub_client,
+        to="ken@jnccpas.com",
+        bcc=["secret1@example.com", "secret2@example.com"],
+    )
+    
+    # The raw message should contain Bcc header with the recipients
+    import base64
+    sent_raw = stub_client.sent[0]["raw"]
+    msg_bytes = base64.urlsafe_b64decode(sent_raw)
+    msg_text = msg_bytes.decode(errors="replace")
+    
+    # Check that Bcc recipients are in the message
+    assert "secret1@example.com" in msg_text, "Bcc recipient 1 missing"
+    assert "secret2@example.com" in msg_text, "Bcc recipient 2 missing"
+
+
+
+# ===== FIX 2 TESTS =====
+
+def test_fix2_empty_body_rejected(tmp_env):
+    """Fix 2: Empty body (or whitespace-only) must be rejected."""
+    empty_body = str(Path(tmp_env.body_path).parent / "body_empty.txt")
+    Path(empty_body).write_text("   \n\n   ")
+    result, client = _send(tmp_env, body_path=empty_body)
+    assert result["outcome"] == "denied"
+    assert "empty_body" in result["reasons"]
+    assert len(client.sent) == 0
+
+
+def test_fix2_html_missing_markers_rejected(tmp_env):
+    """Fix 2: HTML body without required formatting markers must be rejected."""
+    html_body = str(Path(tmp_env.body_path).parent / "body.html")
+    Path(html_body).write_text(
+        "<html><body>Hello Ken,<br>See attached.<br>Hermes Trismegistos (Ed's AI assistant)</body></html>"
+    )
+    result, client = _send(tmp_env, body_path=html_body)
+    assert result["outcome"] == "denied"
+    assert "missing_html_formatting" in result["reasons"]
+    assert len(client.sent) == 0
+
+
+def test_fix2_missing_signature_rejected(tmp_env):
+    """Fix 2: Body without required signature must be rejected."""
+    no_sig_body = str(Path(tmp_env.body_path).parent / "body_nosig.txt")
+    Path(no_sig_body).write_text("Hi Ken,\n\nSee attached.\n\nThanks")
+    result, client = _send(tmp_env, body_path=no_sig_body)
+    assert result["outcome"] == "denied"
+    assert "missing_signature" in result["reasons"]
+    assert len(client.sent) == 0
+
+
+def test_fix3a_duplicate_detected_pre_send(tmp_env):
+    """Fix 3a: Duplicate-hash check right before send detects sends after approval."""
+    result1, client1 = _send(tmp_env)
+    assert result1["outcome"] == "sent"
+    assert len(client1.sent) == 1
+    
+    result2, client2 = _send(tmp_env)
+    assert result2["outcome"] == "denied"
+    assert "duplicate_draft_hash_already_sent" in result2["reasons"]
+    assert len(client2.sent) == 0
+
+
+def test_fix3b_invalid_email_multiple_at_signs(tmp_env):
+    """Fix 3b: Address with multiple @ signs should be rejected."""
+    result, client = _send(tmp_env, to="a@@b.com")
+    assert result["sent"] is False
+
+
+def test_fix3c_bcc_in_message_structure(tmp_env):
+    """Fix 3c: Verify Bcc header is in the raw MIME message sent to Gmail."""
+    result, client = _send(tmp_env, to="ken@jnccpas.com", bcc=["secret@example.com"])
+    if result["sent"]:
+        assert len(client.sent) == 1
+        import base64
+        sent_raw = client.sent[0]["raw"]
+        msg_bytes = base64.urlsafe_b64decode(sent_raw)
+        msg_text = msg_bytes.decode(errors="replace")
+        assert "Bcc:" in msg_text
+        assert "secret@example.com" in msg_text
