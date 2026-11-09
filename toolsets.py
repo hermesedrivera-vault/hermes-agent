@@ -127,6 +127,13 @@ TOOLSETS = {
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    "email": _ts(
+        "send_email() -- the ONE in-process way an actual Gmail send can happen. "
+        "Every policy check (unknown-recipient/SSN-pattern cards, 20/day rate limit, "
+        "attachment content scan) is enforced in-process before anything is sent. "
+        "Opt-in: not part of the default core toolset.",
+        ["send_email"],
+    ),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),

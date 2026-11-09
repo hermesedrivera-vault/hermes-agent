@@ -400,3 +400,46 @@ def send_email(
     _log("sent", rfc_message_id, gmail_id=gmail_id)
     return SendEmailResult(outcome="sent", sent=True, message_id=rfc_message_id, reasons=reasons,
                             detail="sent").to_dict()
+
+
+def check_send_email_requirements() -> bool:
+    """Gate for exposing the tool at all -- requires the approved-recipient
+    list and the canonical enforced-send script to exist. No external
+    network/credential check here (that happens per-send, not at startup)."""
+    return os.path.exists(DEFAULT_APPROVED_LIST_PATH) and os.path.exists(CANONICAL_ENFORCED_GMAIL_PATH)
+
+
+# Fix 3 (Ed's review, 11/9/26): send_email() was built but never registered
+# as a callable tool -- a deploy with no registration leaves no way to
+# actually send. SEND_EMAIL_SCHEMA + the agent/inline_tool_executors.py
+# dispatch entry together are what make it callable; this schema only
+# exposes the model-facing fields (to/subject/body_path/cc/bcc/attachments/
+# from_account) -- every policy-enforcement/test seam parameter
+# (approval_gate, log_path, enforced_module, attachment_text_extractor,
+# ...) stays fixed at its production default and is never model-settable.
+SEND_EMAIL_SCHEMA = {
+    "name": "send_email",
+    "description": (
+        "Send ONE real email from hermes.ed.rivera@gmail.com. Every policy check "
+        "(unknown-recipient card, SSN/JNC-pattern card, from_account='ed' rejected "
+        "outright, 20/day rate limit, attachment content scan) runs in-process before "
+        "anything is sent; a card-required send waits on Ed's approval and is logged "
+        "either way. This is the ONLY way an actual Gmail send can happen -- never "
+        "call enforced_gmail_send.py or google_api.py directly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Primary recipient address (or comma-joined addresses)."},
+            "subject": {"type": "string"},
+            "body_path": {"type": "string", "description": "Path to the HTML or plain-text body file."},
+            "cc": {"type": "array", "items": {"type": "string"},
+                   "description": "Additional Cc addresses. ed.rivera@gmail.com is always added automatically."},
+            "bcc": {"type": "array", "items": {"type": "string"}},
+            "attachments": {"type": "array", "items": {"type": "string"}, "description": "Paths to attach."},
+            "from_account": {"type": "string", "enum": ["hermes"],
+                              "description": "Always 'hermes' -- 'ed' has no credential and is rejected outright."},
+        },
+        "required": ["to", "subject", "body_path"],
+    },
+}
