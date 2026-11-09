@@ -382,3 +382,103 @@ def test_logged_message_id_is_rfc_header_not_gmail_internal_id(tmp_env):
     logged = list(read_entries(path=tmp_env.log_path))
     assert logged[-1]["message_id"] == result["message_id"]
     assert logged[-1]["gmail_id"] == client.sent[0]["id"]
+
+
+# Fix 4 (Ed's review, 11/9/26) -- hash binding + single-use + re-verify ----
+def test_hash_mismatch_between_approval_and_send_is_refused(tmp_env, monkeypatch):
+    """Defense-in-depth: if the draft hash computed right before the real
+    send ever differs from the one that was approved, refuse -- even though
+    nothing in send_email() normally mutates the inputs between those two
+    points, a tampered/forged approval must not slip past this check."""
+    import tools.send_email_tool as se
+
+    original = se.compute_draft_hash
+    calls = {"n": 0}
+
+    def flaky_hash(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs) if calls["n"] == 1 else "tampered-hash-value"
+
+    monkeypatch.setattr(se, "compute_draft_hash", flaky_hash)
+    result, client = _send(tmp_env, approval_gate=_approve_gate, to="stranger@example.com")
+    assert result["outcome"] == "denied"
+    assert "hash_mismatch_at_send" in result["reasons"]
+    assert client.sent == []
+
+
+def test_duplicate_draft_hash_already_sent_is_refused_without_a_card(tmp_env):
+    """A carded draft is single-use: a prior 'sent' log entry with the exact
+    same hash means this content already went out once. A byte-identical
+    resend must be refused outright -- no card, no second approval needed
+    to refuse it -- even if the gate would have approved it again."""
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    first, client1 = _send(tmp_env, approval_gate=gate, to="stranger@example.com")
+    assert first["outcome"] == "sent"
+    assert len(calls) == 1
+
+    calls.clear()
+    second, client2 = _send(tmp_env, approval_gate=gate, to="stranger@example.com")
+    assert second["outcome"] == "denied"
+    assert "duplicate_draft_hash_already_sent" in second["reasons"]
+    assert calls == [], "a known-duplicate draft must never even reach the approval gate"
+    assert client2.sent == []
+
+
+def test_card_payload_carries_body_preview_and_attachment_names(tmp_env):
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    _send(tmp_env, approval_gate=gate, to="stranger@example.com", attachments=["RIVERA_ED_2025.pdf"])
+    assert "body_preview" in calls[-1] and "Hi Ken" in calls[-1]["body_preview"]
+    assert calls[-1]["attachment_names"] == ["RIVERA_ED_2025.pdf"]
+    assert "draft_hash" in calls[-1] and len(calls[-1]["draft_hash"]) == 64  # sha256 hex
+
+
+def test_once_only_approval_gate_requests_no_session_no_permanent(monkeypatch):
+    """Fix 4 (Ed's review, 11/9/26): the card must go through the SAME
+    once-only gateway path the protected-instruction-file write gate uses
+    (live-verified against Ed's Telegram), with allow_permanent=False and
+    allow_session=False in the approval_data dict handed to
+    _await_gateway_decision -- the card offers only Approve once / Deny."""
+    import tools.send_email_tool as se
+
+    captured = {}
+
+    def fake_await_gateway_decision(session_key, notify_cb, approval_data, surface=None):
+        captured.update(approval_data)
+        return {"choice": "once", "resolved": True}
+
+    monkeypatch.setattr("tools.approval_context.get_current_session_key", lambda: "sess-1")
+    monkeypatch.setattr("tools.approval_gateway_wait._await_gateway_decision", fake_await_gateway_decision)
+
+    import tools.approval as _approval
+    monkeypatch.setattr(_approval, "_gateway_notify_cbs", {"sess-1": lambda *a, **k: None})
+
+    result = se.request_once_only_approval("desc", "<display>", "pattern:abc")
+    assert result == {"approved": True, "outcome": "approved"}
+    assert captured["allow_permanent"] is False
+    assert captured["allow_session"] is False
+
+
+def test_once_only_approval_gate_fails_closed_when_gateway_unreachable(monkeypatch):
+    """No gateway notify callback AND no CLI approval callback registered
+    (gateway down / no interactive session) -- must fail closed, no
+    'outcome' key (the gate_unreachable signal _classify_gate_result reads)."""
+    import tools.send_email_tool as se
+
+    monkeypatch.setattr("tools.approval_context.get_current_session_key", lambda: "sess-none")
+    import tools.approval as _approval
+    monkeypatch.setattr(_approval, "_gateway_notify_cbs", {})
+    monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: None)
+
+    result = se.request_once_only_approval("desc", "<display>", "pattern:abc")
+    assert result["approved"] is False
+    assert "outcome" not in result

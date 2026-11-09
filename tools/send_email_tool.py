@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from email.utils import getaddresses, make_msgid
 from typing import Any, Callable, Optional, Sequence
 
-from tools.email_send_log import append_log_entry, count_today
+from tools.email_send_log import append_log_entry, count_today, read_entries
 
 CANONICAL_ENFORCED_GMAIL_PATH = os.path.realpath(
     "/home/hermes/.hermes/skills/email/enforced-gmail-send/scripts/enforced_gmail_send.py"
@@ -107,6 +107,34 @@ def _extract_attachment_text(path: str) -> Optional[str]:
 class GateUnreachableError(Exception):
     """Raised by an approval_gate implementation when no human/gateway channel
     exists to deliver a card (Telegram down, no interactive session, etc.)."""
+
+
+# Fix 4 (Ed's review, 11/9/26): the approval card must be bound to a sha256
+# of EVERY field that defines this exact draft, re-verified right before
+# the real send (defense against anything changing between "approved" and
+# "sent"), and single-use for a carded draft -- an "always"/"session"
+# choice at the human-approval-gate UI layer still exists generically (that
+# UI is shared by every tool, not send_email-specific), but even if chosen,
+# a repeat call with byte-identical content is refused here at the
+# application layer before any second real send (see the duplicate-hash
+# check in send_email() below) -- "approve once" cannot be stretched into
+# "resend forever" just because the gate remembered a decision.
+import hashlib
+
+
+def compute_draft_hash(from_account: str, to: str, cc: Sequence[str], bcc: Sequence[str],
+                        subject: str, body_text: str, attachment_bytes: Sequence[bytes]) -> str:
+    """Hash of everything that defines THIS draft. Any change invalidates it."""
+    h = hashlib.sha256()
+    h.update(("from:" + (from_account or "")).encode())
+    h.update(("to:" + (to or "")).encode())
+    h.update(("cc:" + ",".join(sorted(cc or []))).encode())
+    h.update(("bcc:" + ",".join(sorted(bcc or []))).encode())
+    h.update(("subject:" + (subject or "")).encode())
+    h.update(("body:" + (body_text or "")).encode())
+    for data in attachment_bytes:
+        h.update(b"attach:" + data)
+    return h.hexdigest()
 
 
 @dataclass
@@ -210,18 +238,93 @@ def _recipients_from_built_message(msg, bcc: Sequence[str]) -> list[str]:
     return recipients
 
 
-def _default_approval_gate(payload: dict) -> dict:
-    """Production default: escalate to the real in-process human-approval gate
-    (tools.approval.request_tool_approval), which already implements fail-closed-
-    when-no-human semantics identically to what this spec requires.
-    """
-    from tools.approval import request_tool_approval
+def request_once_only_approval(description: str, display: str, pattern_key: str) -> dict:
+    """Fix 4 (Ed's review, 11/9/26): the SAME once-only gateway/CLI path the
+    protected-instruction-file write gate uses
+    (tools/file_tools_write_guards.py:_request_protected_instruction_approval,
+    live-verified 11/1/26 against Ed's Telegram -- a denied kenneth-rosa
+    config.yaml write and this morning's outbound_classify.py cards both
+    went through this exact code shape). allow_permanent=False,
+    allow_session=False throughout: the card offers only Approve once / Deny,
+    never a persisted scope. Deliberately NOT routed through
+    request_tool_approval()/_run_approval_gate() -- neither has an
+    allow_session/allow_permanent knob, and extending the shared gate used
+    by every other tool was explicitly ruled out (11/9/26: too large a
+    blast radius to verify in this pass).
 
-    reason = (
+    Returns ``{"approved": bool, "outcome": ...}`` -- "outcome" is present
+    ONLY for a real human decision (approved/denied/timeout); its absence
+    is the gate-unreachable signal (no human/gateway channel at all),
+    matching ``_classify_gate_result``'s existing contract.
+    """
+    try:
+        import tools.approval as _approval
+        from tools.approval_context import get_current_session_key, _no_user_can_answer, _fire_approval_hook
+        from tools.approval_gateway_wait import _await_gateway_decision
+        from tools.approval_prompt import prompt_dangerous_approval
+    except Exception:
+        return {"approved": False}  # gate_unreachable: approval subsystem unavailable
+
+    session_key = get_current_session_key()
+    try:
+        with _approval._lock:
+            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+    except Exception:
+        notify_cb = None
+
+    if notify_cb is not None:
+        # Gateway surface (Telegram/desktop card): block on the button
+        # round-trip. One-operation only -- no scope buttons offered.
+        approval_data = {
+            "command": display, "pattern_key": pattern_key, "pattern_keys": [pattern_key],
+            "description": description, "allow_permanent": False, "allow_session": False,
+        }
+        decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
+        if decision.get("notify_failed") or decision.get("cancelled"):
+            return {"approved": False}  # gate_unreachable: card could not be delivered/was withdrawn
+        choice, timed = decision.get("choice"), not decision.get("resolved")
+    else:
+        # CLI surface: per-thread approval callback (prompt_toolkit panel).
+        try:
+            from tools.terminal_tool import _get_approval_callback
+            callback = _get_approval_callback()
+        except Exception:
+            callback = None
+        if callback is None or _no_user_can_answer():
+            return {"approved": False}  # gate_unreachable: no human channel present
+        hook_kwargs = dict(command=display, description=description, pattern_key=pattern_key,
+                           pattern_keys=[pattern_key], session_key=session_key, surface="cli")
+        _fire_approval_hook("pre_approval_request", **hook_kwargs)
+        choice = prompt_dangerous_approval(
+            display, description, allow_permanent=False, allow_session=False, approval_callback=callback)
+        _fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
+        if choice == "cancelled":
+            return {"approved": False}  # gate_unreachable: prompt never reached a human
+        timed = choice == "timeout"
+
+    # Any tapped scope is a one-operation grant; nothing is persisted. (The
+    # UI only ever offers once/deny here, but this mirrors the proven
+    # protected-instruction gate's own defensive handling exactly.)
+    if not timed and choice in {"once", "session", "always"}:
+        return {"approved": True, "outcome": "approved"}
+    return {"approved": False, "outcome": "timeout" if timed else "denied"}
+
+
+def _once_only_approval_gate(payload: dict) -> dict:
+    """Production default approval_gate for send_email() -- see
+    request_once_only_approval(). Card includes a body preview and
+    attachment names (Fix 4); rule_key/pattern_key is the draft's own
+    sha256 hash, never a bare to+subject string (Fix 4: bound to every
+    field that defines this exact draft)."""
+    description = (
         f"send_email card: to={payload.get('to')} cc={payload.get('cc')} bcc={payload.get('bcc')} "
-        f"subject={payload.get('subject')!r} reasons={payload.get('reasons')}"
+        f"subject={payload.get('subject')!r} reasons={payload.get('reasons')}\n"
+        f"Body preview: {payload.get('body_preview', '')!r}\n"
+        f"Attachments: {payload.get('attachment_names', [])}"
     )
-    return request_tool_approval("send_email", reason, rule_key=f"send_email:{payload.get('draft_id', '')}")
+    display = f"<send_email to={payload.get('to')} subject={payload.get('subject')!r}>"
+    pattern_key = f"send_email:{payload.get('draft_hash', '')}"
+    return request_once_only_approval(description, display, pattern_key)
 
 
 def _classify_gate_result(result: dict) -> str:
@@ -264,7 +367,7 @@ def send_email(
     "outcome" key present only for a real human decision). Defaults to the
     real in-process gate.
     """
-    approval_gate = approval_gate or _default_approval_gate
+    approval_gate = approval_gate or _once_only_approval_gate
     approved_list_path = approved_list_path or DEFAULT_APPROVED_LIST_PATH
     enforced = enforced_module or _load_enforced_gmail_module()
 
@@ -338,6 +441,28 @@ def send_email(
     if _text_has_tax_ssn_pattern(scan_text):
         reasons.append("tax_ssn_pattern")
 
+    # Fix 4: hash every field that defines this draft, including attachment
+    # BYTES (not the extracted text -- the hash must change if the file
+    # changes even if extraction failed or returned the same text).
+    attachment_bytes: list[bytes] = []
+    for path in (attachments or []):
+        try:
+            with open(path, "rb") as f:
+                attachment_bytes.append(f.read())
+        except OSError:
+            attachment_bytes.append(f"__missing__:{path}".encode())
+    draft_hash = compute_draft_hash(from_account, to, cc, bcc, subject, body_text, attachment_bytes)
+
+    # Fix 4: a carded draft is single-use -- a prior SENT entry with this
+    # EXACT hash means this content already went out once; refuse a
+    # second send of byte-identical content even if the gate remembers an
+    # "always"/"session" choice for this rule_key (2026-09-09 multi-draft
+    # regression class, applied here to send_email() specifically).
+    already_sent = any(
+        e.get("draft_hash") == draft_hash and e.get("outcome") == "sent"
+        for e in read_entries(path=log_path)
+    )
+
     # Minor fix (Ed's review, 11/9/26): from_account="ed" is not a card
     # candidate -- there is no credential for ed.rivera@gmail.com on this
     # box at all, so a card that could never be approved into an actual
@@ -361,11 +486,29 @@ def send_email(
             "message_id": message_id, "gmail_id": gmail_id, "to": (to or "").lower(),
             "cc": [a.lower() for a in cc], "bcc": [a.lower() for a in bcc], "subject": subject,
             "from_account": from_account, "source": "send_email", "outcome": outcome, "reasons": reasons,
+            "draft_hash": draft_hash,
         }, path=log_path)
 
+    # Fix 4: single-use enforcement -- refuse outright, before ever showing
+    # a card, if this exact draft hash already has a "sent" entry.
+    if already_sent:
+        _log("denied", None)
+        return SendEmailResult(
+            outcome="denied", sent=False, reasons=reasons + ["duplicate_draft_hash_already_sent"],
+            detail="this exact draft (same from/to/cc/bcc/subject/body/attachments) was already "
+                   "sent once; one approval = one send -- re-approve explicitly if this is "
+                   "genuinely a new send (e.g. a resend after a bounce), by changing the subject "
+                   "or body even slightly.",
+        ).to_dict()
+
     if needs_card:
-        payload = {"to": to, "cc": cc, "bcc": bcc, "subject": subject, "reasons": reasons,
-                   "draft_id": f"{to}:{subject}"}
+        # Fix 4: body preview + attachment names in the card, bound to a
+        # sha256 of every field that defines this exact draft.
+        payload = {
+            "to": to, "cc": cc, "bcc": bcc, "subject": subject, "reasons": reasons,
+            "body_preview": body_text[:500], "attachment_names": [p.split("/")[-1] for p in (attachments or [])],
+            "draft_hash": draft_hash, "draft_id": draft_hash,
+        }
         try:
             gate_result = approval_gate(payload)
         except GateUnreachableError:
@@ -384,6 +527,20 @@ def send_email(
                 detail="approval denied; not sent",
             ).to_dict()
         # approved -> fall through to the real send below.
+
+    # Fix 4: re-verify the hash RIGHT BEFORE sending -- recomputed from the
+    # same inputs that were approved. Nothing in this function mutates
+    # to/cc/bcc/subject/body_text/attachment_bytes between the approval
+    # above and here, so this is a hard equality that must never fail in
+    # practice; if it ever does, something changed state in a way this
+    # function doesn't control and the send must be refused, not guessed at.
+    if compute_draft_hash(from_account, to, cc, bcc, subject, body_text, attachment_bytes) != draft_hash:
+        _log("denied", None)
+        return SendEmailResult(
+            outcome="denied", sent=False, reasons=reasons + ["hash_mismatch_at_send"],
+            detail="draft hash changed between approval and send -- refusing to send what was "
+                   "never actually approved.",
+        ).to_dict()
 
     # The real send (auto-send path, or a card that was just approved).
     # msg/cc_list/token/rfc_message_id were already built above (Fix 1/6) --
