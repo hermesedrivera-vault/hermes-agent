@@ -58,7 +58,8 @@ def tmp_env(tmp_path):
     }))
     body_path = tmp_path / "body.txt"
     body_path.write_text("Hi Ken,\n\nSee attached.\n\nHermes")
-    return SimpleNamespace(log_path=log_path, approved_path=str(approved_path), body_path=str(body_path))
+    return SimpleNamespace(log_path=log_path, approved_path=str(approved_path), body_path=str(body_path),
+                            tmp_path=tmp_path)
 
 
 class _FakeEnforcedModule:
@@ -86,6 +87,7 @@ def _send(tmp_env, approval_gate=_approve_gate, **overrides):
         gmail_client=StubGmailClient(), approval_gate=approval_gate,
         log_path=tmp_env.log_path, approved_list_path=tmp_env.approved_path,
         enforced_module=_FakeEnforcedModule,
+        allowed_dirs=[str(tmp_env.tmp_path)],
     )
     kwargs.update(overrides)
     return se.send_email(**kwargs), kwargs["gmail_client"]

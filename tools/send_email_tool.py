@@ -113,9 +113,13 @@ def _load_allowed_dirs(profile_path: Optional[str] = None) -> list[str]:
     
     Raises ValueError if the config file cannot be read or parsed.
     """
-    # Try profile path first (for tests), then fall back to live profile
+    # Try profile path first (for tests), then the HERMES_HOME env var (set by the
+    # test harness's home_io_guard / isolated-profile fixtures), then fall back to
+    # the live profile. Hardcoding ~/.hermes here previously broke every test in
+    # this suite that runs under an isolated HERMES_HOME, by reaching for the real
+    # home instead of the fixture's temp home.
     if profile_path is None:
-        profile_path = os.path.expanduser("~/.hermes")
+        profile_path = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
     
     allowed_dirs_file = os.path.join(profile_path, "protected", "send_email_allowed_dirs.json")
     
@@ -397,6 +401,7 @@ def send_email(
     approved_list_path: Optional[str] = None,
     enforced_module: Optional[types.ModuleType] = None,
     attachment_text_extractor: Optional[Callable[[str], Optional[str]]] = None,
+    allowed_dirs: Optional[Sequence[str]] = None,
 ) -> dict:
     """Send one email, enforcing every v3 policy check before any real send.
 
@@ -409,6 +414,13 @@ def send_email(
     like ``tools.approval``'s gate results (``{"approved": bool, ...}``,
     "outcome" key present only for a real human decision). Defaults to the
     real in-process gate.
+
+    *allowed_dirs* (test seam, Fix 1): explicit override for the
+    allowed-directories list body_path/attachments must resolve inside.
+    Production default is None, which loads the protected config via
+    _load_allowed_dirs() (the live, Ed-approved allow-list). Tests pass an
+    explicit list (e.g. the test's own tmp_path) instead of requiring a
+    real protected-config file to exist under a sandboxed HERMES_HOME.
     """
     approval_gate = approval_gate or _once_only_approval_gate
     approved_list_path = approved_list_path or DEFAULT_APPROVED_LIST_PATH
@@ -419,10 +431,11 @@ def send_email(
 
     # Fix 1 (Critical exfiltration): Validate body_path and all attachments
     # are within allowed directories and don't contain secrets before reading
-    try:
-        allowed_dirs = _load_allowed_dirs()
-    except ValueError as e:
-        return {"error": f"Path validation failed: {e}", "sent": False}
+    if allowed_dirs is None:
+        try:
+            allowed_dirs = _load_allowed_dirs()
+        except ValueError as e:
+            return {"error": f"Path validation failed: {e}", "sent": False}
     
     # Validate body_path
     path_error = _validate_path_and_content(body_path, allowed_dirs, is_attachment=False)
