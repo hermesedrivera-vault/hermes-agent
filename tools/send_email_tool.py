@@ -791,6 +791,17 @@ def check_send_email_requirements() -> bool:
 # from_account) -- every policy-enforcement/test seam parameter
 # (approval_gate, log_path, enforced_module, attachment_text_extractor,
 # ...) stays fixed at its production default and is never model-settable.
+# Fix 3 (Ed's review, 11/9/26 -- CORRECTED 11/10/26: the schema/dispatch-table
+# entry alone never made this callable. registry.register() was never called,
+# so discover_builtin_tools() never found "send_email" and no model on any
+# platform ever received its schema -- confirmed failing directly against
+# live main before this fix (test_send_email_tool_real_registration.py).
+# toolset="email" is what platform_toolsets.<platform> / agent.disabled_toolsets
+# actually filter on (hermes_cli.tools_config._get_platform_tools) -- this MUST
+# match the toolset name already used by toolsets.TOOLSETS["email"] and by
+# kenneth-rosa's config.yaml disabled_toolsets entry, or the two go out of sync.
+from tools.registry import registry
+
 SEND_EMAIL_SCHEMA = {
     "name": "send_email",
     "description": (
@@ -817,3 +828,25 @@ SEND_EMAIL_SCHEMA = {
         "required": ["to", "subject", "body_path"],
     },
 }
+
+
+def _handle_send_email(args: dict, **_kw) -> dict:
+    return send_email(
+        to=args.get("to"),
+        subject=args.get("subject"),
+        body_path=args.get("body_path"),
+        cc=args.get("cc"),
+        bcc=args.get("bcc"),
+        attachments=args.get("attachments"),
+        from_account=args.get("from_account", "hermes"),
+    )
+
+
+registry.register(
+    name="send_email",
+    toolset="email",
+    schema=SEND_EMAIL_SCHEMA,
+    handler=_handle_send_email,
+    check_fn=check_send_email_requirements,
+    emoji="\U0001F4E7",
+)
