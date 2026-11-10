@@ -609,7 +609,7 @@ def test_duplicate_draft_hash_at_send_time_catches_race(tmp_env):
     
     # Should be denied at send time, not sent, because duplicate was logged between card and send
     assert result["outcome"] == "denied"
-    assert "duplicate_draft_hash_at_send_time" in result["reasons"]
+    assert "duplicate_draft_hash_already_sent_pre_send" in result["reasons"]
     assert client.sent == [], "should NOT have called gmail_send despite approval"
 
 

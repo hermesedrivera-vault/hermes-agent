@@ -444,6 +444,27 @@ def send_email(
     
     # Validate all attachments
     for attachment_path in (attachments or []):
+        if not os.path.exists(os.path.expanduser(attachment_path)):
+            # No real file on disk -- nothing to exfiltrate via path/secrets
+            # validation (there's no content to read). This covers two
+            # legitimate cases: (1) a test supplies a custom
+            # attachment_text_extractor for a fake path by design (several
+            # tests do this specifically so "no real PDF needed" -- scan
+            # whatever it returns for secrets, same bar as a real file), or
+            # (2) no extractor and no real file at all, which the existing
+            # downstream pipeline already handles correctly and more safely
+            # than a hard block would: it falls through to
+            # attachment_extraction_failed (forces a card, never a silent
+            # auto-send) while the filename itself still gets scanned for a
+            # JNC-client-file-name pattern via scan_text below.
+            if attachment_text_extractor is not None:
+                extracted = attachment_text_extractor(attachment_path)
+                if extracted:
+                    secret_error = _check_content_for_secrets(extracted)
+                    if secret_error:
+                        return {"error": f"Attachment rejected ({attachment_path}): {secret_error}",
+                                "sent": False, "blocked": True}
+            continue
         path_error = _validate_path_and_content(attachment_path, allowed_dirs, is_attachment=True)
         if path_error:
             return {"error": f"Attachment rejected ({attachment_path}): {path_error}", "sent": False, "blocked": True}
@@ -503,6 +524,22 @@ def send_email(
     msg, cc_list = enforced.build_message(args, token)
     if MANDATORY_CC not in cc_list:
         raise RuntimeError("INTERNAL ERROR: mandatory CC missing -- refusing to send.")
+
+    # Fix 3c (Ed's review, 11/9/26 -- corrected: this must ADD the header, not
+    # just check for it): Gmail's messages.send API requires Bcc to be in the
+    # raw MIME message itself (unlike raw SMTP, which has a separate
+    # envelope-bcc parameter the API has no equivalent for).
+    # enforced_gmail_send.py's build_message() deliberately never writes a
+    # Bcc header (correct for a script meant to print a human-readable
+    # preview to the terminal), so send_email() must add it itself -- done
+    # HERE, immediately after the message is built and before anything else
+    # reads from it (draft_hash, the approval card, the recipient-parsing
+    # below), so what gets hashed/shown/approved is byte-for-byte identical
+    # to what gets sent. Adding it any later would mean the card shows a
+    # message without Bcc while the real send has it -- the exact
+    # approved-vs-sent mismatch Fix 4's hash check exists to prevent.
+    if bcc and not msg.get("Bcc"):
+        msg["Bcc"] = ", ".join(bcc)
 
     # Fix 6 (Ed's review, 11/9/26): set the RFC Message-Id header OURSELVES,
     # before sending, rather than relying on Gmail's internal message "id"
@@ -691,20 +728,20 @@ def send_email(
                 detail=f"Invalid email address format: {addr}",
             ).to_dict()
 
-    # Fix 3c: Verify Bcc header is present in the raw MIME message before sending.
-    # Gmail's messages.send API requires the Bcc to be in the raw message itself
-    # (unlike raw SMTP which has a separate envelope-bcc parameter).
+    # Fix 3c sanity check: the header was injected right after build_message()
+    # above; this just proves it before encoding, rather than denying (the
+    # injection makes a missing header effectively unreachable, but fail
+    # loud rather than silently dropping bcc delivery if that ever changes).
     raw_message_bytes = msg.as_bytes()
     raw_message_str = raw_message_bytes.decode('utf-8', errors='replace')
     if bcc:
-        # Check that the Bcc header is in the raw message (verify before encoding to base64)
-        has_bcc_header = any("Bcc:" in line for line in raw_message_str.split('\n'))
+        has_bcc_header = any(line.lower().startswith("bcc:") for line in raw_message_str.split('\n'))
         if not has_bcc_header:
             reasons.append("bcc_header_missing")
             _log("denied", None)
             return SendEmailResult(
                 outcome="denied", sent=False, reasons=reasons,
-                detail=f"Bcc header not found in raw MIME message. Bcc delivery would fail.",
+                detail="Bcc header not found in raw MIME message despite injection. Bcc delivery would fail.",
             ).to_dict()
 
     # The real send (auto-send path, or a card that was just approved).
