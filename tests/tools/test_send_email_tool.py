@@ -57,7 +57,7 @@ def tmp_env(tmp_path):
         "addresses": ["ed.rivera@gmail.com"],
     }))
     body_path = tmp_path / "body.txt"
-    body_path.write_text("Hi Ken,\n\nSee attached.\n\nHermes")
+    body_path.write_text("Hi Ken,\n\nSee attached.\n\nHermes Trismegistos (Ed's AI assistant)")
     return SimpleNamespace(log_path=log_path, approved_path=str(approved_path), body_path=str(body_path),
                             tmp_path=tmp_path)
 
@@ -130,7 +130,7 @@ def test_ssn_shaped_pattern_requires_card_in_body_and_attachment_name(tmp_env):
         return {"approved": True, "outcome": "approved"}
 
     ssn_body = tmp_env.body_path.replace("body.txt", "body_ssn.txt")
-    Path(ssn_body).write_text("Ken, Ed's SSN is 123-45-6789, please file his return.")
+    Path(ssn_body).write_text("Ken, Ed's SSN is 123-45-6789, please file his return.\n\nHermes Trismegistos (Ed's AI assistant)")
     _send(tmp_env, approval_gate=gate, body_path=ssn_body)
     assert "tax_ssn_pattern" in calls[-1]["reasons"]
 
@@ -147,7 +147,8 @@ def test_tax_words_alone_do_not_require_a_card(tmp_env):
     words_body = tmp_env.body_path.replace("body.txt", "body_words.txt")
     Path(words_body).write_text(
         "Ken, can you confirm the 1099 and W-2 are ready, and whether the "
-        "Form 1040 tax return needs anything else from me? Thanks, Ed."
+        "Form 1040 tax return needs anything else from me? Thanks, Ed.\n\n"
+        "Hermes Trismegistos (Ed's AI assistant)"
     )
     result, client = _send(
         tmp_env, approval_gate=lambda p: pytest.fail("tax vocabulary alone must not card"),
@@ -161,7 +162,7 @@ def test_bare_nine_digits_with_no_ssn_label_do_not_require_a_card(tmp_env):
     tracking or account number) must auto-send -- _TAX_CONTEXT_RE's
     adjacency requirement is what prevents this false positive."""
     nums_body = tmp_env.body_path.replace("body.txt", "body_nums.txt")
-    Path(nums_body).write_text("Ken, the tracking number for the mailed documents is 123456789.")
+    Path(nums_body).write_text("Ken, the tracking number for the mailed documents is 123456789.\n\nHermes Trismegistos (Ed's AI assistant)")
     result, client = _send(
         tmp_env, approval_gate=lambda p: pytest.fail("bare 9 digits with no label must not card"),
         body_path=nums_body,
@@ -498,8 +499,9 @@ def test_empty_body_text_requires_card(tmp_env):
     Path(empty_body).write_text("")  # empty file
     
     result, client = _send(tmp_env, approval_gate=gate, body_path=empty_body)
-    assert "body_format_invalid" in result["reasons"]
-    assert len(calls) == 1, "should have shown card for empty body"
+    assert result["outcome"] == "denied"
+    assert "empty_body" in result["reasons"]
+    assert len(calls) == 0, "empty-body check is a hard denial, never reaches the approval gate"
 
 
 def test_whitespace_only_body_text_requires_card(tmp_env):
@@ -513,7 +515,8 @@ def test_whitespace_only_body_text_requires_card(tmp_env):
     Path(ws_body).write_text("   \n\n  \t\t  \n  ")  # only whitespace
     
     result, client = _send(tmp_env, approval_gate=gate, body_path=ws_body)
-    assert "body_format_invalid" in result["reasons"]
+    assert result["outcome"] == "denied"
+    assert "empty_body" in result["reasons"]
 
 
 def test_html_body_missing_text_align_justify_requires_card(tmp_env):
@@ -528,8 +531,9 @@ def test_html_body_missing_text_align_justify_requires_card(tmp_env):
     Path(html_body).write_text('<html><body style="line-height: 1.5">Test email</body></html>')
     
     result, client = _send(tmp_env, approval_gate=gate, body_path=html_body)
-    assert "body_format_invalid" in result["reasons"]
-    assert len(calls) == 1
+    assert result["outcome"] == "denied"
+    assert "missing_html_formatting" in result["reasons"]
+    assert len(calls) == 0, "HTML-formatting check is a hard denial, never reaches the approval gate"
 
 
 def test_html_body_missing_line_height_requires_card(tmp_env):
@@ -544,14 +548,16 @@ def test_html_body_missing_line_height_requires_card(tmp_env):
     Path(html_body).write_text('<html><body style="text-align: justify">Test email</body></html>')
     
     result, client = _send(tmp_env, approval_gate=gate, body_path=html_body)
-    assert "body_format_invalid" in result["reasons"]
+    assert result["outcome"] == "denied"
+    assert "missing_html_formatting" in result["reasons"]
 
 
 def test_html_body_with_both_markers_auto_sends(tmp_env):
     """HTML body with both required markers must NOT require a card."""
     html_body = tmp_env.body_path.replace("body.txt", "body_good.html")
     Path(html_body).write_text(
-        '<html><body style="text-align: justify; line-height: 1.5">Test email for Ken.</body></html>'
+        '<html><body style="text-align: justify; line-height: 1.5">'
+        "Test email for Ken.<br>Hermes Trismegistos (Ed's AI assistant)</body></html>"
     )
     
     result, _ = _send(
