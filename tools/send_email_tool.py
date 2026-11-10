@@ -322,16 +322,20 @@ def _parsed_addresses(header_value: Optional[str]) -> list[str]:
     """Every individual address in a comma-joined header value, lowercased.
 
     Raises ValueError if any parsed entry is not a single, well-formed
-    addr-spec (empty address, or a realname with no '@', etc.) -- callers
-    must treat that as "cannot verify this field is safe" and card it,
-    never guess which part was intended.
+    addr-spec (empty address, a realname with no '@', more than one '@',
+    etc.) -- callers must treat that as a hard format problem, not a trust
+    judgment, and deny outright rather than asking for approval of
+    something that can never be a valid send target.
     """
     if not header_value:
         return []
     out = []
     for realname, addr in getaddresses([header_value]):
         addr = (addr or "").strip()
-        if not addr or "@" not in addr or addr.startswith("@") or addr.endswith("@"):
+        if not addr or addr.count("@") != 1 or addr.startswith("@") or addr.endswith("@"):
+            raise ValueError(f"unparsable address entry in header: {realname!r} {addr!r}")
+        local_part, _, domain_part = addr.partition("@")
+        if not local_part or "." not in domain_part or domain_part.startswith(".") or domain_part.endswith("."):
             raise ValueError(f"unparsable address entry in header: {realname!r} {addr!r}")
         out.append(addr.lower())
     return out
@@ -442,32 +446,21 @@ def send_email(
     if path_error:
         return {"error": f"Body path rejected: {path_error}", "sent": False, "blocked": True}
     
-    # Validate all attachments
+    # Validate all attachments. A missing attachment is refused outright
+    # (Ed's review, 11/10/26: the old code silently skipped path/secret
+    # validation for a nonexistent file "because there's nothing to
+    # exfiltrate" -- but that also meant a typo'd or already-deleted
+    # attachment path would sail through every check and only fail later,
+    # deep in the pipeline, with a confusing error. A missing attachment is
+    # now a hard, early, unambiguous denial.)
     for attachment_path in (attachments or []):
         if not os.path.exists(os.path.expanduser(attachment_path)):
-            # No real file on disk -- nothing to exfiltrate via path/secrets
-            # validation (there's no content to read). This covers two
-            # legitimate cases: (1) a test supplies a custom
-            # attachment_text_extractor for a fake path by design (several
-            # tests do this specifically so "no real PDF needed" -- scan
-            # whatever it returns for secrets, same bar as a real file), or
-            # (2) no extractor and no real file at all, which the existing
-            # downstream pipeline already handles correctly and more safely
-            # than a hard block would: it falls through to
-            # attachment_extraction_failed (forces a card, never a silent
-            # auto-send) while the filename itself still gets scanned for a
-            # JNC-client-file-name pattern via scan_text below.
-            if attachment_text_extractor is not None:
-                extracted = attachment_text_extractor(attachment_path)
-                if extracted:
-                    secret_error = _check_content_for_secrets(extracted)
-                    if secret_error:
-                        return {"error": f"Attachment rejected ({attachment_path}): {secret_error}",
-                                "sent": False, "blocked": True}
-            continue
+            return {"error": f"Attachment not found: {attachment_path}", "sent": False,
+                    "blocked": True, "reasons": ["attachment_missing"]}
         path_error = _validate_path_and_content(attachment_path, allowed_dirs, is_attachment=True)
         if path_error:
             return {"error": f"Attachment rejected ({attachment_path}): {path_error}", "sent": False, "blocked": True}
+
 
     with open(body_path, encoding="utf-8") as f:
         body_text = f.read()
@@ -487,6 +480,11 @@ def send_email(
     # Check 1: Body is not empty/whitespace-only
     if not body_text.strip():
         reasons.append("empty_body")
+        append_log_entry({
+            "message_id": None, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
+            "bcc": [a.lower() for a in bcc], "subject": subject, "from_account": from_account,
+            "source": "send_email", "outcome": "denied", "reasons": reasons, "draft_hash": None,
+        }, path=log_path)
         return SendEmailResult(
             outcome="denied", sent=False, reasons=reasons,
             detail="Body is empty (or whitespace-only). This is the exact failure mode from "
@@ -499,6 +497,11 @@ def send_email(
         missing = [m for m in REQUIRED_HTML_MARKERS if m not in body_text]
         if missing:
             reasons.append("missing_html_formatting")
+            append_log_entry({
+                "message_id": None, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
+                "bcc": [a.lower() for a in bcc], "subject": subject, "from_account": from_account,
+                "source": "send_email", "outcome": "denied", "reasons": reasons, "draft_hash": None,
+            }, path=log_path)
             return SendEmailResult(
                 outcome="denied", sent=False, reasons=reasons,
                 detail=f"HTML body missing required formatting marker(s): {missing}. "
@@ -510,6 +513,11 @@ def send_email(
     REQUIRED_SIGNATURE = "Hermes Trismegistos (Ed's AI assistant)"
     if REQUIRED_SIGNATURE not in body_text:
         reasons.append("missing_signature")
+        append_log_entry({
+            "message_id": None, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
+            "bcc": [a.lower() for a in bcc], "subject": subject, "from_account": from_account,
+            "source": "send_email", "outcome": "denied", "reasons": reasons, "draft_hash": None,
+        }, path=log_path)
         return SendEmailResult(
             outcome="denied", sent=False, reasons=reasons,
             detail=f"Body must include the signature '{REQUIRED_SIGNATURE}'. "
@@ -561,9 +569,35 @@ def send_email(
     # never guess which part of a malformed field was intended.
     try:
         recipients = _recipients_from_built_message(msg, bcc)
-    except ValueError:
-        recipients = []
-        reasons.append("unknown_recipient")
+    except ValueError as e:
+        # Fix 3b (corrected, 11/10/26): a malformed/unparsable address entry
+        # is a format problem, not a trust judgment -- deny outright, before
+        # ever showing a card, rather than asking Ed to approve something
+        # that can never be a valid send target. This also fixes the actual
+        # placement bug Ed found: the OLD code ran a raw-string "@" count
+        # check on the whole, possibly comma-joined `to` input AFTER the
+        # approval card -- so a legitimately comma-joined
+        # "x@unknown.com, ken@jnccpas.com" (which the schema allows) got
+        # miscounted as one malformed blob and denied AFTER Ed had already
+        # approved it. The check now runs on PARSED, per-address entries
+        # (via _recipients_from_built_message / getaddresses, using the
+        # addresses as they actually ended up in the built message), before
+        # needs_card is ever computed -- so a comma-joined field with
+        # individually well-formed addresses sails through to the normal
+        # unknown_recipient/approved-list logic below, while a genuinely
+        # malformed entry (multiple '@', no '@', empty local/domain part)
+        # is refused immediately.
+        append_log_entry({
+            "message_id": None, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
+            "bcc": [a.lower() for a in bcc], "subject": subject, "from_account": from_account,
+            "source": "send_email", "outcome": "denied", "reasons": ["invalid_email_format"],
+            "draft_hash": None,
+        }, path=log_path)
+        return SendEmailResult(
+            outcome="denied", sent=False, reasons=["invalid_email_format"],
+            detail=f"Invalid/unparsable recipient address format ({e}); denying outright -- "
+                   "this is a format problem, not a judgment call, so there is no card to show.",
+        ).to_dict()
     unknown = [addr for addr in recipients if not _is_approved_recipient(addr, approved)]
     if unknown:
         reasons.append("unknown_recipient")
@@ -703,30 +737,11 @@ def send_email(
                    "refusing duplicate send.",
         ).to_dict()
 
-    # Fix 3b: Validate every To/Cc/Bcc address has exactly one '@' and valid addr-spec.
-    import re
-    email_regex = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
-    all_addresses_to_check = [to] + cc + bcc
-    for addr in all_addresses_to_check:
-        if not addr:
-            continue
-        addr = addr.strip()
-        # Count '@' symbols - must be exactly one
-        if addr.count("@") != 1:
-            reasons.append("invalid_email_format")
-            _log("denied", None)
-            return SendEmailResult(
-                outcome="denied", sent=False, reasons=reasons,
-                detail=f"Invalid email address (wrong '@' count): {addr}",
-            ).to_dict()
-        # Basic regex check for valid format
-        if not email_regex.match(addr):
-            reasons.append("invalid_email_format")
-            _log("denied", None)
-            return SendEmailResult(
-                outcome="denied", sent=False, reasons=reasons,
-                detail=f"Invalid email address format: {addr}",
-            ).to_dict()
+    # Fix 3b's address-format validation now runs earlier, on parsed
+    # per-address entries, before the approval card (see above). The
+    # duplicate raw-string post-card check that used to live here was the
+    # actual bug this session fixed -- removed.
+
 
     # Fix 3c sanity check: the header was injected right after build_message()
     # above; this just proves it before encoding, rather than denying (the

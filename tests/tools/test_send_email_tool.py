@@ -135,7 +135,9 @@ def test_ssn_shaped_pattern_requires_card_in_body_and_attachment_name(tmp_env):
     assert "tax_ssn_pattern" in calls[-1]["reasons"]
 
     calls.clear()
-    _send(tmp_env, approval_gate=gate, attachments=["RIVERA_ED_2025.pdf"])
+    jnc_attachment = str(tmp_env.tmp_path / "RIVERA_ED_2025.pdf")
+    Path(jnc_attachment).write_bytes(b"%PDF-1.4 stand-in, filename pattern is what matters here")
+    _send(tmp_env, approval_gate=gate, attachments=[jnc_attachment])
     assert "tax_ssn_pattern" in calls[-1]["reasons"]
 
 
@@ -299,6 +301,32 @@ def test_comma_joined_to_with_unapproved_first_address_requires_card(tmp_env):
     assert "unknown_recipient" in calls[-1]["reasons"]
 
 
+# Fix 3b placement bug (Ed's review, 11/10/26) ------------------------------
+# The buggy post-card raw-string check used to deny this AFTER approval --
+# a comma-joined `to` that the schema explicitly allows (one unapproved +
+# one approved address) must card once, get approved, and actually SEND to
+# both addresses -- never get silently denied after the human already said
+# yes.
+def test_comma_joined_to_approved_sends_to_both_addresses(tmp_env):
+    calls = []
+
+    def gate(payload):
+        calls.append(payload)
+        return {"approved": True, "outcome": "approved"}
+
+    result, client = _send(tmp_env, approval_gate=gate, to="x@unknown.com, ken@jnccpas.com")
+    assert len(calls) == 1, "comma-joined to= with one unapproved address must still card once"
+    assert "unknown_recipient" in calls[-1]["reasons"]
+    assert result["outcome"] == "sent" and result["sent"] is True, (
+        "approving the card must actually send -- the old bug denied this AFTER approval "
+        "because the post-card raw-string check miscounted the comma-joined string's '@'s"
+    )
+    assert len(client.sent) == 1, "approval must result in exactly one real send, to both addresses"
+    import base64
+    decoded = base64.urlsafe_b64decode(client.sent[0]["raw"]).decode()
+    assert "x@unknown.com" in decoded and "ken@jnccpas.com" in decoded
+
+
 def test_display_name_wrapped_address_is_parsed_and_checked(tmp_env):
     """'Ken Rosa <ken@jnccpas.com>' must parse to ken@jnccpas.com (approved,
     auto-sends) -- display-name wrapping must not itself trigger a card, and
@@ -344,10 +372,13 @@ def test_attachment_content_ssn_requires_card(tmp_env):
         return {"approved": True, "outcome": "approved"}
 
     def fake_extractor(path):
-        assert path == "clean_name.pdf"
-        return "Client SSN on file: 123-45-6789"
+        assert path == attachment_path
+        return "Client SSN on file: 900-00-0000"
 
-    _send(tmp_env, approval_gate=gate, attachments=["clean_name.pdf"],
+    attachment_path = str(tmp_env.tmp_path / "clean_name.pdf")
+    Path(attachment_path).write_bytes(b"%PDF-1.4 stand-in, real file required since Ed's 11/10 fix")
+
+    _send(tmp_env, approval_gate=gate, attachments=[attachment_path],
           attachment_text_extractor=fake_extractor)
     assert "tax_ssn_pattern" in calls[-1]["reasons"]
 
@@ -364,9 +395,27 @@ def test_attachment_extraction_failure_requires_card(tmp_env):
     def failing_extractor(path):
         return None
 
-    _send(tmp_env, approval_gate=gate, attachments=["unreadable.pdf"],
+    attachment_path = str(tmp_env.tmp_path / "unreadable.pdf")
+    Path(attachment_path).write_bytes(b"%PDF-1.4 stand-in, real file required since Ed's 11/10 fix")
+
+    _send(tmp_env, approval_gate=gate, attachments=[attachment_path],
           attachment_text_extractor=failing_extractor)
     assert "attachment_extraction_failed" in calls[-1]["reasons"]
+
+
+# Ed's review, 11/10/26 -- a missing attachment is refused outright, never
+# silently skipped. (The old code treated "no file on disk" as "nothing to
+# exfiltrate" and let the send proceed past this check entirely.)
+def test_missing_attachment_is_denied_outright(tmp_env):
+    missing_path = str(tmp_env.tmp_path / "does_not_exist.pdf")
+    result, client = _send(
+        tmp_env, approval_gate=lambda p: pytest.fail("a missing attachment is a hard denial, never a card"),
+        attachments=[missing_path],
+    )
+    assert result.get("sent") is False
+    assert result.get("blocked") is True
+    assert "attachment_missing" in result.get("reasons", [])
+    assert client.sent == []
 
 
 # Fix 6 (Ed's review, 11/9/26) -- RFC Message-Id, not Gmail's internal id ---
@@ -439,7 +488,9 @@ def test_card_payload_carries_body_preview_and_attachment_names(tmp_env):
         calls.append(payload)
         return {"approved": True, "outcome": "approved"}
 
-    _send(tmp_env, approval_gate=gate, to="stranger@example.com", attachments=["RIVERA_ED_2025.pdf"])
+    jnc_attachment = str(tmp_env.tmp_path / "RIVERA_ED_2025.pdf")
+    Path(jnc_attachment).write_bytes(b"%PDF-1.4 stand-in, real file required since Ed's 11/10 fix")
+    _send(tmp_env, approval_gate=gate, to="stranger@example.com", attachments=[jnc_attachment])
     assert "body_preview" in calls[-1] and "Hi Ken" in calls[-1]["body_preview"]
     assert calls[-1]["attachment_names"] == ["RIVERA_ED_2025.pdf"]
     assert "draft_hash" in calls[-1] and len(calls[-1]["draft_hash"]) == 64  # sha256 hex
@@ -615,51 +666,57 @@ def test_duplicate_draft_hash_at_send_time_catches_race(tmp_env):
 
 # Fix 3b: Email address validation =============================================
 def test_invalid_address_multiple_at_signs_requires_card(tmp_env):
-    """Address with multiple '@' signs (a@@b.com) must require approval card."""
+    """Address with multiple '@' signs (a@@b.com) is denied outright -- a
+    format problem, never a card (Ed's review, 11/10/26: fixed the
+    placement bug where this used to run on the raw string AFTER a card)."""
     calls = []
     def gate(payload):
         calls.append(payload)
         return {"approved": True, "outcome": "approved"}
     
     result, _ = _send(tmp_env, approval_gate=gate, to="a@@b.com")
-    assert len(calls) == 1, "multiple @ should trigger card"
-    assert "unknown_recipient" in calls[-1]["reasons"]
+    assert len(calls) == 0, "a malformed address is a hard denial, never a card"
+    assert result["outcome"] == "denied" and result["sent"] is False
+    assert "invalid_email_format" in result["reasons"]
 
 
 def test_invalid_address_no_at_sign_requires_card(tmp_env):
-    """Address with no '@' (not-an-email) must require approval card."""
+    """Address with no '@' (not-an-email) is denied outright, no card."""
     calls = []
     def gate(payload):
         calls.append(payload)
         return {"approved": True, "outcome": "approved"}
     
     result, _ = _send(tmp_env, approval_gate=gate, to="not-an-email")
-    assert len(calls) == 1
-    assert "unknown_recipient" in calls[-1]["reasons"]
+    assert len(calls) == 0
+    assert result["outcome"] == "denied" and result["sent"] is False
+    assert "invalid_email_format" in result["reasons"]
 
 
 def test_invalid_address_empty_local_part_requires_card(tmp_env):
-    """Address with empty local part (@domain.com) must require approval card."""
+    """Address with empty local part (@domain.com) is denied outright, no card."""
     calls = []
     def gate(payload):
         calls.append(payload)
         return {"approved": True, "outcome": "approved"}
     
     result, _ = _send(tmp_env, approval_gate=gate, to="@example.com")
-    assert len(calls) == 1
-    assert "unknown_recipient" in calls[-1]["reasons"]
+    assert len(calls) == 0
+    assert result["outcome"] == "denied" and result["sent"] is False
+    assert "invalid_email_format" in result["reasons"]
 
 
 def test_invalid_address_empty_domain_requires_card(tmp_env):
-    """Address with empty domain (user@) must require approval card."""
+    """Address with empty domain (user@) is denied outright, no card."""
     calls = []
     def gate(payload):
         calls.append(payload)
         return {"approved": True, "outcome": "approved"}
     
     result, _ = _send(tmp_env, approval_gate=gate, to="user@")
-    assert len(calls) == 1
-    assert "unknown_recipient" in calls[-1]["reasons"]
+    assert len(calls) == 0
+    assert result["outcome"] == "denied" and result["sent"] is False
+    assert "invalid_email_format" in result["reasons"]
 
 
 def test_valid_address_on_approved_list_still_auto_sends(tmp_env):
