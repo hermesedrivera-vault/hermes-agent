@@ -255,6 +255,18 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,
     ),
+    # Fix 3 (Ed's review, 11/9/26): send_email() is the ONE in-process way an
+    # actual Gmail send can happen -- it was built but never registered as a
+    # callable tool, leaving no way to send once deployed. Only the
+    # model-facing fields are mapped here; approval_gate/log_path/etc. are
+    # left at their production defaults (the real in-process approval gate,
+    # the real send log path) -- never settable from model arguments.
+    "send_email": _tool(
+        "tools.send_email_tool", "send_email",
+        ("to", "to"), ("subject", "subject"), ("body_path", "body_path"),
+        ("cc", "cc"), ("bcc", "bcc"), ("attachments", "attachments"),
+        ("from_account", "from_account", "hermes"),
+    ),
     # Bot Mode teammate DM is injected, not registered: only a canonical Bot
     # Chat session carries the schema, and the tool re-gates on the title.
     "message_agent": _tool(

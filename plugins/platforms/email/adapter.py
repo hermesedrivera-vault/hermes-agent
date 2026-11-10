@@ -877,11 +877,34 @@ class EmailAdapter(BasePlatformAdapter):
         return msg, msg_id, subject
 
     def _smtp_send(self, msg: MIMEMultipart) -> None:
-        """Login, send, and always release the SMTP connection (quit, else close)."""
+        """Login, send, and always release the SMTP connection (quit, else close).
+
+        Every real SMTP send funnels through here (_send_email and
+        _send_with_files both call this) -- the single place to append a
+        send-log entry so it can never be forgotten on one path and not the
+        other. Uses the SAME shared log module/schema/path as send_email()
+        (tools.email_send_log) so the no_agent digest can cross-check both
+        outbound paths against one source of truth.
+        """
         smtp = self._connect_smtp()
         try:
             smtp.login(self._address, self._password)
             smtp.send_message(msg)
+            try:
+                from tools.email_send_log import append_log_entry
+                append_log_entry({
+                    "message_id": msg.get("Message-ID"), "to": (msg.get("To") or "").lower(),
+                    "cc": [a.strip().lower() for a in (msg.get("Cc") or "").split(",") if a.strip()],
+                    "bcc": [a.strip().lower() for a in (msg.get("Bcc") or "").split(",") if a.strip()],
+                    "subject": msg.get("Subject"), "from_account": "adapter",
+                    "source": "email_adapter", "outcome": "sent", "reasons": [],
+                })
+            except Exception:
+                # Logging must never take down a send that already happened on
+                # the wire -- but it must be loud, so the digest's cross-check
+                # has a chance of catching the gap from the other side.
+                logger.error("[Email] send-log append failed for a message that WAS sent (subject: %s)",
+                             msg.get("Subject"))
         finally:
             try:
                 smtp.quit()
