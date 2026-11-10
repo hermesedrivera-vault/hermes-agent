@@ -830,8 +830,19 @@ SEND_EMAIL_SCHEMA = {
 }
 
 
-def _handle_send_email(args: dict, **_kw) -> dict:
-    return send_email(
+def _handle_send_email(args: dict, **_kw) -> str:
+    """Registry handler contract (ToolRegistry._normalize_handler_result,
+    tools/registry.py): a result must be a string (or the multimodal
+    envelope) -- anything else is replaced with a generic
+    'unsupported result type' error, discarding every real detail.
+    send_email() itself returns a plain dict (SendEmailResult.to_dict()),
+    so this handler MUST serialize it before returning -- this is the
+    other half of the 11/10 fix (removing send_email from
+    INLINE_TOOL_EXECUTORS routes it through the registry, but the registry
+    path still needs a real string out of the handler, or every call --
+    success or failure -- collapses into the same opaque
+    'tool_result_contract' error)."""
+    result = send_email(
         to=args.get("to"),
         subject=args.get("subject"),
         body_path=args.get("body_path"),
@@ -840,6 +851,7 @@ def _handle_send_email(args: dict, **_kw) -> dict:
         attachments=args.get("attachments"),
         from_account=args.get("from_account", "hermes"),
     )
+    return json.dumps(result, ensure_ascii=False)
 
 
 registry.register(

@@ -48,20 +48,30 @@ def test_requirements_gate_is_callable_and_boolean(tmp_path, monkeypatch):
     assert check_send_email_requirements() is False
 
 
-def test_dispatch_table_registers_send_email():
-    """The in-process gateway dispatch table (agent/inline_tool_executors.py)
-    must resolve 'send_email' to tools.send_email_tool.send_email with the
-    right model-facing args mapped -- this is what makes the tool actually
-    callable, not just documented."""
+def test_send_email_dispatches_only_through_the_registry():
+    """CORRECTED 11/10/26: the original version of this test asserted
+    send_email lived in agent/inline_tool_executors.py's
+    _RAW_INLINE_TOOL_EXECUTORS table -- exactly the dual-registration bug
+    that caused the 11/10 incident (a raw dict from send_email()'s blocked
+    path landed straight in a tool-result message's "content" field,
+    because the inline table bypasses ToolRegistry._normalize_handler_result
+    entirely; OpenRouter then rejected the whole turn with HTTP 400
+    'messages.N.content: Invalid input'). send_email is a pure function with
+    no live-AIAgent-state dependency, so it must dispatch ONLY through the
+    registry (see test_send_email_result_is_string.py for the real,
+    end-to-end proof that registry.dispatch('send_email', ...) always
+    returns a string)."""
     from agent.inline_tool_executors import _RAW_INLINE_TOOL_EXECUTORS
 
-    assert "send_email" in _RAW_INLINE_TOOL_EXECUTORS
-    executor = _RAW_INLINE_TOOL_EXECUTORS["send_email"]
+    assert "send_email" not in _RAW_INLINE_TOOL_EXECUTORS, (
+        "send_email is back in the inline dispatch table -- this bypasses "
+        "result-string normalization and reintroduces the 11/10 "
+        "OpenRouter-400 incident."
+    )
+
+    from tools.registry import registry
 
     calls = []
-
-    class _Ctx:
-        tool_call_id = "t1"
 
     import tools.send_email_tool as se
     original = se.send_email
@@ -72,11 +82,16 @@ def test_dispatch_table_registers_send_email():
 
     se.send_email = _spy
     try:
-        result = executor(None, {"to": "ken@jnccpas.com", "subject": "hi", "body_path": "/tmp/b.txt"}, _Ctx())
+        result = registry.dispatch(
+            "send_email", {"to": "ken@jnccpas.com", "subject": "hi", "body_path": "/tmp/b.txt"},
+        )
     finally:
         se.send_email = original
 
-    assert result["outcome"] == "sent"
+    assert isinstance(result, str), "registry.dispatch('send_email', ...) must always return a string"
+    import json as _json
+    parsed = _json.loads(result)
+    assert parsed["outcome"] == "sent"
     assert len(calls) == 1
     assert calls[0]["to"] == "ken@jnccpas.com"
     assert calls[0]["from_account"] == "hermes"  # default applied

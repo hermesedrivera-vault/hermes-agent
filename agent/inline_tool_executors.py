@@ -255,18 +255,21 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,
     ),
-    # Fix 3 (Ed's review, 11/9/26): send_email() is the ONE in-process way an
-    # actual Gmail send can happen -- it was built but never registered as a
-    # callable tool, leaving no way to send once deployed. Only the
-    # model-facing fields are mapped here; approval_gate/log_path/etc. are
-    # left at their production defaults (the real in-process approval gate,
-    # the real send log path) -- never settable from model arguments.
-    "send_email": _tool(
-        "tools.send_email_tool", "send_email",
-        ("to", "to"), ("subject", "subject"), ("body_path", "body_path"),
-        ("cc", "cc"), ("bcc", "bcc"), ("attachments", "attachments"),
-        ("from_account", "from_account", "hermes"),
-    ),
+    # Fix (Ed's review, 11/10/26 -- CORRECTED: send_email does NOT belong in this
+    # table. This table is for tools that need live AIAgent state (session DB,
+    # callbacks, etc.) and therefore bypass the registry's result normalization
+    # (ToolRegistry._normalize_handler_result, tools/registry.py) -- but send_email()
+    # is a pure function with no agent-state dependency, and it is already
+    # registry.register()'d in tools/send_email_tool.py with toolset="email".
+    # Having it in BOTH places meant this inline entry's un-normalized raw dict
+    # return value (e.g. {"error": ..., "sent": False, "blocked": True} from a
+    # path-validation rejection) was put directly into a tool-result message's
+    # "content" field as a Python dict, never converted to a string/JSON -- which
+    # OpenRouter's API rejected outright ("messages.N.content: Invalid input"),
+    # breaking the entire turn. Removing send_email from this table lets it fall
+    # through to the normal registry.dispatch() path, whose
+    # _normalize_handler_result() guarantees every result is a string (or the
+    # multimodal envelope) before it ever reaches a message.
     # Bot Mode teammate DM is injected, not registered: only a canonical Bot
     # Chat session carries the schema, and the tool re-gates on the title.
     "message_agent": _tool(
