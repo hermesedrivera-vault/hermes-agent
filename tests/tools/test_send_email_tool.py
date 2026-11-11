@@ -18,7 +18,10 @@ from tools.email_send_log import append_log_entry, read_entries
 
 
 class StubGmailClient:
-    """Records every (raw, thread_id, token) send instead of hitting the network."""
+    """Records every (raw, thread_id, token) send instead of hitting the network.
+    get_full() simulates Gmail's real, empirically-confirmed behavior (2026-11-11
+    live probe): the SENT copy's actual Message-Id header is NOT the one the
+    client set before sending -- it's a different, Gmail-generated one."""
 
     def __init__(self):
         self.sent = []
@@ -32,6 +35,11 @@ class StubGmailClient:
         self._next_id += 1
         self.sent.append({"raw": raw, "thread_id": thread_id, "token": token, "id": msg_id})
         return {"id": msg_id}
+
+    def get_full(self, msg_id, token):
+        return {"payload": {"headers": [
+            {"name": "Message-Id", "value": f"<gmail-rewritten-{msg_id}@mail.gmail.com>"},
+        ]}}
 
 
 def _approve_gate(_payload):
@@ -93,7 +101,89 @@ def _send(tmp_env, approval_gate=_approve_gate, **overrides):
     return se.send_email(**kwargs), kwargs["gmail_client"]
 
 
-# 1 -----------------------------------------------------------------------
+# Message-ID fix (Ed's spec, 11/11/26) ---------------------------------------
+def test_sent_log_entry_uses_actual_gmail_message_id_not_client_generated(tmp_env):
+    """Gmail rewrites the Message-Id header on the API send path (confirmed
+    live, 2026-11-11). The log's "message_id" field -- what the digest's
+    bypass check keys on -- must be the ACTUAL header Gmail will report back
+    via gmail_get_full, not the one send_email() generated before sending."""
+    result, client = _send(tmp_env)
+    assert result["outcome"] == "sent"
+    gmail_id = client.sent[0]["id"]
+    logged = list(read_entries(path=tmp_env.log_path))[0]
+    # StubGmailClient.get_full() always returns "<gmail-rewritten-{id}@mail.gmail.com>"
+    assert logged["message_id"] == f"<gmail-rewritten-{gmail_id}@mail.gmail.com>"
+    assert logged["gmail_id"] == gmail_id
+    # the client-generated id (make_msgid(), Fix 6) is preserved separately,
+    # never used for the digest's cross-check, and is NOT equal to the
+    # actual id (proving the rewrite was captured, not just echoed back).
+    assert logged["client_message_id"] is not None
+    assert logged["client_message_id"] != logged["message_id"]
+    assert result["message_id"] == logged["message_id"]
+    assert result["client_message_id"] == logged["client_message_id"]
+    assert "actual_message_id_fetch_failed" not in result["reasons"]
+
+
+def test_actual_message_id_fetch_failure_falls_back_without_failing_the_send(tmp_env):
+    """The email already left the building (gmail_id exists) once send()
+    returns -- a failure fetching it back (network blip, transient API error)
+    must never be reported as a send failure. Falls back to the
+    client-generated id and flags the gap so ops/the digest can see it."""
+    class _FlakyGetFullClient(StubGmailClient):
+        def get_full(self, msg_id, token):
+            raise RuntimeError("simulated transient Gmail API error")
+
+    result, client = _send(tmp_env, gmail_client=_FlakyGetFullClient())
+    assert result["outcome"] == "sent"
+    assert result["sent"] is True
+    assert "actual_message_id_fetch_failed" in result["reasons"]
+    logged = list(read_entries(path=tmp_env.log_path))[0]
+    # fallback: logged message_id IS the client-generated one (best we have)
+    assert logged["message_id"] == logged["client_message_id"] == result["message_id"]
+
+
+def test_missing_message_id_header_in_fetched_message_also_falls_back(tmp_env):
+    """A fetched message with no Message-Id header at all (malformed/edge-case
+    API response) is treated the same as a fetch failure -- fall back, flag,
+    never silently log None as the id the digest will look for."""
+    class _NoHeaderClient(StubGmailClient):
+        def get_full(self, msg_id, token):
+            return {"payload": {"headers": []}}
+
+    result, client = _send(tmp_env, gmail_client=_NoHeaderClient())
+    assert result["outcome"] == "sent"
+    assert "actual_message_id_fetch_failed" in result["reasons"]
+    logged = list(read_entries(path=tmp_env.log_path))[0]
+    assert logged["message_id"] == logged["client_message_id"]
+
+
+def test_production_default_fetches_via_enforced_module_gmail_get_full(tmp_env, monkeypatch):
+    """When no gmail_client test seam is given, production must call
+    enforced.gmail_get_full(gmail_id, token) -- the same function
+    scripts/send_email_digest.py's real client already uses -- never a
+    method that doesn't exist on the real enforced_gmail_send.py module."""
+    sent_calls = []
+
+    class _ProdLikeEnforced(_FakeEnforcedModule):
+        @staticmethod
+        def gmail_send(raw, thread_id, token):
+            sent_calls.append(raw)
+            return {"id": "prod-gmail-id-1"}
+
+        @staticmethod
+        def gmail_get_full(msg_id, token):
+            assert msg_id == "prod-gmail-id-1"
+            return {"payload": {"headers": [
+                {"name": "Message-Id", "value": "<real-prod-header@mail.gmail.com>"},
+            ]}}
+
+    result, _ = _send(tmp_env, gmail_client=None, enforced_module=_ProdLikeEnforced)
+    assert result["outcome"] == "sent"
+    assert result["message_id"] == "<real-prod-header@mail.gmail.com>"
+    assert sent_calls, "enforced.gmail_send was never called"
+
+
+
 def test_known_recipient_auto_sends_no_card(tmp_env):
     result, client = _send(tmp_env, approval_gate=lambda p: pytest.fail("card should not be shown"))
     assert result["outcome"] == "sent"
@@ -225,6 +315,7 @@ def test_card_approved_sends_with_mandatory_cc_and_logs_sent(tmp_env):
 def test_card_denied_not_sent_and_logs_denied(tmp_env):
     result, client = _send(tmp_env, approval_gate=_deny_gate, to="stranger@example.com")
     assert result == {"outcome": "denied", "sent": False, "message_id": None,
+                       "client_message_id": None,
                        "reasons": ["unknown_recipient"], "detail": "approval denied; not sent"}
     assert client.sent == []
     logged = list(read_entries(path=tmp_env.log_path))

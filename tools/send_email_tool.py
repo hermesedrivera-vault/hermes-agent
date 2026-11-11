@@ -258,11 +258,13 @@ class SendEmailResult:
     outcome: str  # "sent" | "denied" | "blocked_gate_unreachable"
     sent: bool
     message_id: Optional[str] = None
+    client_message_id: Optional[str] = None
     reasons: list[str] = field(default_factory=list)
     detail: str = ""
 
     def to_dict(self) -> dict:
         return {"outcome": self.outcome, "sent": self.sent, "message_id": self.message_id,
+                "client_message_id": self.client_message_id,
                 "reasons": self.reasons, "detail": self.detail}
 
 
@@ -661,9 +663,11 @@ def send_email(
 
     needs_card = bool(reasons)
 
-    def _log(outcome: str, message_id: Optional[str], gmail_id: Optional[str] = None) -> None:
+    def _log(outcome: str, message_id: Optional[str], gmail_id: Optional[str] = None,
+             client_message_id: Optional[str] = None) -> None:
         append_log_entry({
-            "message_id": message_id, "gmail_id": gmail_id, "to": (to or "").lower(),
+            "message_id": message_id, "gmail_id": gmail_id, "client_message_id": client_message_id,
+            "to": (to or "").lower(),
             "cc": [a.lower() for a in cc], "bcc": [a.lower() for a in bcc], "subject": subject,
             "from_account": from_account, "source": "send_email", "outcome": outcome, "reasons": reasons,
             "draft_hash": draft_hash,
@@ -771,8 +775,46 @@ def send_email(
         result = enforced.gmail_send(raw, None, token)
     gmail_id = result["id"]
 
-    _log("sent", rfc_message_id, gmail_id=gmail_id)
-    return SendEmailResult(outcome="sent", sent=True, message_id=rfc_message_id, reasons=reasons,
+    # Message-ID fix (Ed's spec, 11/11/26): Gmail's messages.send API does NOT
+    # reliably preserve the Message-Id header we set ourselves before sending
+    # (rfc_message_id, built above via make_msgid() -- Fix 6, 11/9/26).
+    # Empirically confirmed against two real live sends on 2026-11-11: the
+    # client-generated header (e.g. "<1794...@hermes.ed.rivera.gmail.com>")
+    # was replaced by Gmail with its own ("<CAFc=...@mail.gmail.com>") in the
+    # actual SENT copy. Logging the client-generated id as "message_id" made
+    # the digest's cross-check (scripts/send_email_digest.py) compare against
+    # a header Gmail never kept -- a guaranteed false bypass alert on every
+    # real send. Fix: immediately fetch the real SENT message by gmail_id and
+    # log its ACTUAL Message-Id header as "message_id"; the one we generated
+    # is kept separately as "client_message_id" (useful for debugging/
+    # threading, never used for the digest's bypass check).
+    actual_message_id = rfc_message_id
+    message_id_fetch_failed = False
+    try:
+        if gmail_client is not None and hasattr(gmail_client, "get_full"):
+            full = gmail_client.get_full(gmail_id, token)
+        else:
+            full = enforced.gmail_get_full(gmail_id, token)
+        headers = {h["name"]: h["value"] for h in full.get("payload", {}).get("headers", [])}
+        fetched = headers.get("Message-Id") or headers.get("Message-ID")
+        if fetched:
+            actual_message_id = fetched
+        else:
+            message_id_fetch_failed = True
+    except Exception:
+        # The email already sent successfully (gmail_id exists) -- a failure
+        # fetching it back must never be reported as a send failure. Fall back
+        # to the client-generated id so the log always has SOME id, and flag
+        # the gap so the digest/ops can see a fetch problem rather than
+        # silently trusting an id Gmail may not have kept.
+        message_id_fetch_failed = True
+
+    if message_id_fetch_failed:
+        reasons.append("actual_message_id_fetch_failed")
+
+    _log("sent", actual_message_id, gmail_id=gmail_id, client_message_id=rfc_message_id)
+    return SendEmailResult(outcome="sent", sent=True, message_id=actual_message_id,
+                            client_message_id=rfc_message_id, reasons=reasons,
                             detail="sent").to_dict()
 
 
