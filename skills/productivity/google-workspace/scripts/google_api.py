@@ -378,6 +378,7 @@ def gmail_get(args):
 
 
 def gmail_send(args):
+    _outbound_email_disabled(args)
     if _gws_binary():
         message = MIMEText(args.body, "html" if args.html else "plain")
         message["To"] = args.to
@@ -421,6 +422,7 @@ def gmail_send(args):
 
 
 def gmail_reply(args):
+    _outbound_email_disabled(args)
     if _gws_binary():
         original = _run_gws(
             ["gmail", "users", "messages", "get"],
@@ -1145,6 +1147,19 @@ def _docs_insert_text(doc_id: str, text: str, index: int, tab_id: str | None = N
 # =========================================================================
 
 
+def _outbound_email_disabled(args):
+    """Refusal stub (Ed's decision, 2026-11-11): both the CLI dispatch
+    layer AND this function body refuse "send"/"reply" -- a direct import
+    and function call (bypassing argparse entirely) must refuse too.
+    Read/list/search/get/labels/modify subcommands are unaffected."""
+    import sys as _sys
+    print("ERROR: outbound email (gmail send / gmail reply) is disabled in "
+          "google_api.py. Use send_email() instead -- it enforces approval "
+          "cards, logging, and recipient checks this raw CLI bypasses. "
+          "Read/list/search/get/labels/modify are unaffected.", file=_sys.stderr)
+    _sys.exit(2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace API for Hermes Agent")
     sub = parser.add_subparsers(dest="service", required=True)
@@ -1170,13 +1185,13 @@ def main():
     p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
     p.add_argument("--html", action="store_true", help="Send body as HTML")
     p.add_argument("--thread-id", default="", help="Thread ID for threading")
-    p.set_defaults(func=gmail_send)
+    p.set_defaults(func=_outbound_email_disabled)
 
     p = gmail_sub.add_parser("reply")
     p.add_argument("message_id", help="Message ID to reply to")
     p.add_argument("--body", required=True)
     p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
-    p.set_defaults(func=gmail_reply)
+    p.set_defaults(func=_outbound_email_disabled)
 
     p = gmail_sub.add_parser("labels")
     p.set_defaults(func=gmail_labels)
