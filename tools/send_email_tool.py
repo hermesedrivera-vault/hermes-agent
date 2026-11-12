@@ -239,8 +239,14 @@ import hashlib
 
 
 def compute_draft_hash(from_account: str, to: str, cc: Sequence[str], bcc: Sequence[str],
-                        subject: str, body_text: str, attachment_bytes: Sequence[bytes]) -> str:
-    """Hash of everything that defines THIS draft. Any change invalidates it."""
+                        subject: str, body_text: str, attachment_bytes: Sequence[bytes],
+                        plain_body_text: Optional[str] = None) -> str:
+    """Hash of everything that defines THIS draft. Any change invalidates it.
+
+    *plain_body_text* (multipart/alternative fix, 2026-11-12): included so a
+    draft edited only in its plain-text alternative (HTML unchanged) still
+    gets a new hash -- the approved-vs-sent binding must cover both parts.
+    """
     h = hashlib.sha256()
     h.update(("from:" + (from_account or "")).encode())
     h.update(("to:" + (to or "")).encode())
@@ -248,6 +254,7 @@ def compute_draft_hash(from_account: str, to: str, cc: Sequence[str], bcc: Seque
     h.update(("bcc:" + ",".join(sorted(bcc or []))).encode())
     h.update(("subject:" + (subject or "")).encode())
     h.update(("body:" + (body_text or "")).encode())
+    h.update(("plain_body:" + (plain_body_text or "")).encode())
     for data in attachment_bytes:
         h.update(b"attach:" + data)
     return h.hexdigest()
@@ -397,6 +404,7 @@ def send_email(
     subject: str,
     body_path: str,
     *,
+    plain_body_path: Optional[str] = None,
     cc: Optional[Sequence[str]] = None,
     bcc: Optional[Sequence[str]] = None,
     attachments: Optional[Sequence[str]] = None,
@@ -410,6 +418,17 @@ def send_email(
     allowed_dirs: Optional[Sequence[str]] = None,
 ) -> dict:
     """Send one email, enforcing every v3 policy check before any real send.
+
+    *plain_body_path* (new 2026-11-12, multipart/alternative fix): optional
+    path to a plain-text alternative body. When given, the real message
+    carries a genuine multipart/alternative part (plain + HTML, the
+    recipient's client picks) instead of the old single-part body -- this
+    is what fixes the 2026-11-12 07:21 Kenneth-email paragraph-collapse
+    bug (a lone plain-text part with single `\\n` breaks, rendered by
+    Outlook with every paragraph joined into one block). Same path
+    allowlist and secret scan as *body_path*. The required signature line
+    and the empty-body guard apply to it too -- both parts are real mail,
+    either one might be what the recipient's client actually displays.
 
     *gmail_client* (test seam): object with ``refresh_token() -> str``,
     ``send(raw, thread_id, token) -> dict`` (Gmail messages.send shape,
@@ -447,6 +466,13 @@ def send_email(
     path_error = _validate_path_and_content(body_path, allowed_dirs, is_attachment=False)
     if path_error:
         return {"error": f"Body path rejected: {path_error}", "sent": False, "blocked": True}
+
+    # Validate plain_body_path (multipart/alternative fix, 2026-11-12) --
+    # same allowlist/secret-scan treatment as the primary body.
+    if plain_body_path:
+        path_error = _validate_path_and_content(plain_body_path, allowed_dirs, is_attachment=False)
+        if path_error:
+            return {"error": f"Plain body path rejected: {path_error}", "sent": False, "blocked": True}
     
     # Validate all attachments. A missing attachment is refused outright
     # (Ed's review, 11/10/26: the old code silently skipped path/secret
@@ -467,6 +493,11 @@ def send_email(
     with open(body_path, encoding="utf-8") as f:
         body_text = f.read()
 
+    plain_body_text: Optional[str] = None
+    if plain_body_path:
+        with open(plain_body_path, encoding="utf-8") as f:
+            plain_body_text = f.read()
+
     approved = _load_approved_list(approved_list_path)
     reasons: list[str] = []
 
@@ -479,8 +510,10 @@ def send_email(
     # Fix 2: Verify signature/body/HTML checks BEFORE building the message.
     # These checks are called inside enforced.build_message() but test stubs may
     # skip them. We run them here explicitly to ensure they always fire.
-    # Check 1: Body is not empty/whitespace-only
-    if not body_text.strip():
+    # Check 1: Body is not empty/whitespace-only (both parts, if present --
+    # multipart/alternative fix, 2026-11-12: an empty alternative is just as
+    # bad as an empty primary body, so it gets the identical hard refusal).
+    if not body_text.strip() or (plain_body_text is not None and not plain_body_text.strip()):
         reasons.append("empty_body")
         append_log_entry({
             "message_id": None, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
@@ -512,8 +545,13 @@ def send_email(
             ).to_dict()
 
     # Check 3: Validate signature is present (Hermes Trismegistos (Ed's AI assistant))
+    # -- in body_text, AND in plain_body_text too if a plain alternative is
+    # present, since either part might be what the recipient's client renders.
     REQUIRED_SIGNATURE = "Hermes Trismegistos (Ed's AI assistant)"
-    if REQUIRED_SIGNATURE not in body_text:
+    sig_missing = REQUIRED_SIGNATURE not in body_text or (
+        plain_body_text is not None and REQUIRED_SIGNATURE not in plain_body_text
+    )
+    if sig_missing:
         reasons.append("missing_signature")
         append_log_entry({
             "message_id": None, "to": (to or "").lower(), "cc": [a.lower() for a in cc],
@@ -523,12 +561,13 @@ def send_email(
         return SendEmailResult(
             outcome="denied", sent=False, reasons=reasons,
             detail=f"Body must include the signature '{REQUIRED_SIGNATURE}'. "
-                   "This is Ed's standing policy for every external send.",
+                   "This is Ed's standing policy for every external send. When a plain-text "
+                   "alternative is given, it must carry the signature too.",
         ).to_dict()
 
     args = types.SimpleNamespace(
-        to=to, subject=subject, body_file=body_path, cc=cc, bcc=bcc,
-        attach=list(attachments or []), in_reply_to=None, references=None,
+        to=to, subject=subject, body_file=body_path, plain_body_file=plain_body_path,
+        cc=cc, bcc=bcc, attach=list(attachments or []), in_reply_to=None, references=None,
     )
     token = gmail_client.refresh_token() if gmail_client else enforced.refresh_token()
     msg, cc_list = enforced.build_message(args, token)
@@ -619,7 +658,7 @@ def send_email(
             attachment_texts.append(extracted)
     if extraction_failed:
         reasons.append("attachment_extraction_failed")
-    scan_text = "\n".join([subject or "", body_text] + list(attachments or []) + attachment_texts)
+    scan_text = "\n".join([subject or "", body_text, plain_body_text or ""] + list(attachments or []) + attachment_texts)
     if _text_has_tax_ssn_pattern(scan_text):
         reasons.append("tax_ssn_pattern")
 
@@ -633,7 +672,8 @@ def send_email(
                 attachment_bytes.append(f.read())
         except OSError:
             attachment_bytes.append(f"__missing__:{path}".encode())
-    draft_hash = compute_draft_hash(from_account, to, cc, bcc, subject, body_text, attachment_bytes)
+    draft_hash = compute_draft_hash(from_account, to, cc, bcc, subject, body_text, attachment_bytes,
+                                     plain_body_text=plain_body_text)
 
     # Fix 4: a carded draft is single-use -- a prior SENT entry with this
     # EXACT hash means this content already went out once; refuse a
@@ -718,7 +758,8 @@ def send_email(
     # above and here, so this is a hard equality that must never fail in
     # practice; if it ever does, something changed state in a way this
     # function doesn't control and the send must be refused, not guessed at.
-    if compute_draft_hash(from_account, to, cc, bcc, subject, body_text, attachment_bytes) != draft_hash:
+    if compute_draft_hash(from_account, to, cc, bcc, subject, body_text, attachment_bytes,
+                           plain_body_text=plain_body_text) != draft_hash:
         _log("denied", None)
         return SendEmailResult(
             outcome="denied", sent=False, reasons=reasons + ["hash_mismatch_at_send"],
@@ -860,6 +901,10 @@ SEND_EMAIL_SCHEMA = {
             "to": {"type": "string", "description": "Primary recipient address (or comma-joined addresses)."},
             "subject": {"type": "string"},
             "body_path": {"type": "string", "description": "Path to the HTML or plain-text body file."},
+            "plain_body_path": {"type": "string",
+                                 "description": "Optional path to a plain-text alternative body. "
+                                                 "When set, sends real multipart/alternative "
+                                                 "(plain + HTML, client picks)."},
             "cc": {"type": "array", "items": {"type": "string"},
                    "description": "Additional Cc addresses. ed.rivera@gmail.com is always added automatically."},
             "bcc": {"type": "array", "items": {"type": "string"}},
@@ -888,6 +933,7 @@ def _handle_send_email(args: dict, **_kw) -> str:
         to=args.get("to"),
         subject=args.get("subject"),
         body_path=args.get("body_path"),
+        plain_body_path=args.get("plain_body_path"),
         cc=args.get("cc"),
         bcc=args.get("bcc"),
         attachments=args.get("attachments"),
