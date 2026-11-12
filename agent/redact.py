@@ -410,7 +410,7 @@ _PREFIX_PATTERNS = [
     r"sk_live_[A-Za-z0-9]{10,}",        # Stripe secret key (live)
     r"sk_test_[A-Za-z0-9]{10,}",        # Stripe secret key (test)
     r"rk_live_[A-Za-z0-9]{10,}",        # Stripe restricted key
-    r"SG\.[A-Za-z0-9_-]{10,}",          # SendGrid API key
+    r"SG\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?",  # SendGrid API key (id.secret, two dot-segments)
     r"hf_[A-Za-z0-9]{10,}",             # HuggingFace token
     r"r8_[A-Za-z0-9]{10,}",             # Replicate API token
     r"npm_[A-Za-z0-9]{10,}",            # npm access token
@@ -452,6 +452,7 @@ _PREFIX_PATTERNS = [
     r"glwt-[A-Za-z0-9_\-]{10,}",        # GitLab workspace token
     r"GR1348941[A-Za-z0-9_\-]{10,}",    # GitLab legacy runner registration token
     r"pk-lf-[A-Za-z0-9\-]{8,}",         # Langfuse public key (sk-lf- already covered by sk- pattern)
+    r"SK[a-f0-9]{32}",                  # Twilio API Key SID (pairs with a separate API Key Secret)
 ]
 
 # ENV assignment: KEY=value where KEY carries a secret-like name. Uppercase keys

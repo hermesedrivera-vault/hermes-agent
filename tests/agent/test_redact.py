@@ -104,6 +104,26 @@ class TestKnownPrefixes:
         ]:
             assert redact_sensitive_text(benign) == benign
 
+    def test_sendgrid_prefix_redacts(self):
+        """SendGrid API key (``SG.`` prefix) — fake value only."""
+        token = "SG." + "AbCdEfGhIjKlMnOpQrSt" + "." + "UvWxYz0123456789abcdef"
+        result = redact_sensitive_text(f"leaked {token} in output")
+        assert "AbCdEfGhIjKlMnOpQrSt" not in result and "UvWxYz0123456789abcdef" not in result
+
+    def test_twilio_api_key_sid_prefix_redacts(self):
+        """Twilio API Key SID: ``SK`` + 32 lowercase hex chars — fake value only."""
+        fake_sid = "SK" + "0123456789abcdef" * 2  # 32 hex chars
+        result = redact_sensitive_text(f"TWILIO_API_KEY_SID={fake_sid} in config")
+        assert "0123456789abcdef" * 2 not in result
+
+    def test_twilio_prefix_requires_full_hex_length(self):
+        """Prose/short values with 'SK' must not false-positive."""
+        for benign in [
+            "SKateboard park",
+            "SK" + "0123456789abcdef",  # only 16 hex chars, not 32
+        ]:
+            assert redact_sensitive_text(benign) == benign
+
     def test_agentmail_prefix_needs_a_key_shaped_hex_suffix(self):
         """``am_`` is a common identifier prefix; only the documented hex key body is a secret (#10983)."""
         for benign in ["schema.am_example_identifier_123", "path/to/am_monthly_report.sql"]:
