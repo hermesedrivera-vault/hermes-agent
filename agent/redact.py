@@ -221,11 +221,26 @@ def register_known_secret_values() -> int:
         3-4 characters, so an absolute floor is the decisive guard here, independent of
         keyword strength -- the shape check alone isn't enough when the key-name heuristic
         itself is ambiguous.
+
+        Third gap (2026-11-12, access_token over-redaction): the strong-keyword path
+        skips the shape check entirely, so an unfilled template/.env.example value --
+        e.g. ``access_token: "access_token"`` never actually configured -- registered
+        the bare identifier "access_token" as if it were a real secret, then globally
+        substring-replaced that common word everywhere it appeared in ANY tool output
+        (code, docs, other keys), even though it was never a credential. Keep the
+        strong-keyword path (a 16-char Gmail app password or a 40-char token with no
+        recognizable "shape" must still register -- requiring _looks_like_opaque_
+        credential for everything would silently stop redacting real secrets that
+        happen to look unremarkable), but add a narrow placeholder exclusion:
+        _looks_like_placeholder() catches a value that is literally the key's own
+        name, a known placeholder token (changeme, xxx..., <...>, ${...}), or pure
+        snake_case words with no digits (access_token, your_api_key) -- the shape a
+        human-readable identifier has, never a real generated secret.
         """
         if len(value) < 8:
             return False
         if _has_word_bounded_keyword(key, _STRONG_KEY_KEYWORD_RE):
-            return True
+            return not _looks_like_placeholder(key, value)
         return _looks_like_opaque_credential(value)
 
     try:
@@ -615,6 +630,40 @@ def _looks_like_opaque_credential(value: str) -> bool:
     if len(value) < 12:
         return False
     return sum(bool(re.search(p, value)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]")) >= 2
+
+
+_PLACEHOLDER_LITERALS = frozenset({
+    "changeme", "change_me", "change-me", "your_token_here", "your_api_key_here",
+    "placeholder", "example", "n/a", "na", "none", "null", "todo", "tbd", "fixme",
+    "replace_me", "set_me", "unset", "notset", "not_set",
+})
+_PLACEHOLDER_X_RUN_RE = re.compile(r"x{3,}", re.IGNORECASE)
+# Pure human-readable snake_case words (letters only, >=1 underscore) -- real generated
+# secrets never land on this exact shape; a config placeholder/identifier commonly does
+# (``access_token``, ``your_api_key``). Digits/mixed charset anywhere disqualifies it,
+# so a real token that happens to contain one underscore (``ghp_<40 random chars>``)
+# is unaffected.
+_SNAKE_CASE_WORDS_RE = re.compile(r"[A-Za-z]+(?:_[A-Za-z]+)+")
+
+
+def _looks_like_placeholder(key: str, value: str) -> bool:
+    """True when ``value`` is clearly a placeholder/identifier, not a real secret --
+    gates the strong-keyword bypass in register_known_secret_values._should_register
+    (see that docstring's "Third gap" note) without weakening the shape check for
+    values that don't match one of these narrow, deliberately-unambiguous shapes."""
+    v = value.strip()
+    vl = v.lower()
+    if vl == key.strip().lower():
+        return True
+    if vl in _PLACEHOLDER_LITERALS:
+        return True
+    if _PLACEHOLDER_X_RUN_RE.fullmatch(vl):
+        return True
+    if (v.startswith("<") and v.endswith(">")) or (v.startswith("${") and v.endswith("}")):
+        return True
+    if _SNAKE_CASE_WORDS_RE.fullmatch(v):
+        return True
+    return False
 
 
 def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> bool:
