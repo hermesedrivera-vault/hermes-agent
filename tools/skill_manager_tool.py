@@ -674,9 +674,40 @@ def _run_write_gate(build_staging):
 
 
 def _apply_skill_write_gate(action, name, **payload_kwargs):
-    """Flat-shape gate: stage the full kwargs so approval can replay them; bypassed during replay."""
+    """Flat-shape gate: stage the full kwargs so approval can replay them; bypassed during replay.
+
+    Protected-content gate (Ed, 2026-11-17, after a curator over-generalization
+    incident): a curator (background_review-origin) write that targets a
+    protected skill, introduces a protected-content keyword, or removes/weakens
+    a guardrail phrase never lands live — it is proposed instead, via
+    ``tools.curator_protection``, and the real write handler never runs. This
+    check is independent of ``skills.write_approval`` and applies only to the
+    curator's own fork, not foreground agent or user actions.
+    """
     if action not in _ACTION_HANDLERS or _skill_gate_bypass.get():
         return None
+    with suppress(Exception):
+        from tools.skill_provenance import is_background_review
+        if is_background_review():
+            from tools import curator_protection as _cp
+            reason = _cp.classify_write(
+                name, action,
+                **{k: (payload_kwargs.get(k) or "") for k in
+                   ("content", "old_string", "new_string", "file_content", "file_path")})
+            if reason:
+                session_id = ""
+                with suppress(Exception):
+                    from gateway.session_context import get_session_env
+                    session_id = get_session_env("HERMES_SESSION_ID", "") or ""
+                proposal_path = _cp.write_proposal(
+                    name=name, action=action, reason=reason, session_id=session_id,
+                    payload={k: v for k, v in payload_kwargs.items() if v is not None})
+                return json.dumps({
+                    "success": True, "proposed": True, "live_write": False,
+                    "proposal_path": str(proposal_path),
+                    "message": (f"Protected content — proposal filed at {proposal_path}, "
+                                f"NOT applied to the live skill. Reason: {reason}"),
+                }, ensure_ascii=False)
     def _staging(wa):
         payload = {"action": action, "name": name,
                    **{k: v for k, v in payload_kwargs.items() if v is not None}}

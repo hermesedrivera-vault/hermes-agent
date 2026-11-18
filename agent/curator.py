@@ -912,6 +912,25 @@ def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_na
     return final_summary, llm_meta
 
 
+# --- Skills-dir git snapshot (Ed, 2026-11-17: closes the 10/31 no-safety-net gap) ---
+
+def _git_commit_skills(message: str) -> None:
+    """Best-effort ``git add -A && commit`` in ~/.hermes/skills/. No-op if the
+    directory isn't a git repo (set up once via ``git init``) or git is
+    unavailable; never raises, never blocks a curator run."""
+    import subprocess
+    skills_dir = get_hermes_home() / "skills"
+    try:
+        if not (skills_dir / ".git").exists():
+            return
+        subprocess.run(["git", "-C", str(skills_dir), "add", "-A"],
+                        check=False, capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", str(skills_dir), "commit", "--allow-empty",
+                        "-m", message, "--quiet"], check=False, capture_output=True, timeout=30)
+    except Exception as e:
+        logger.debug("Curator git snapshot commit failed (%s): %s", message, e, exc_info=True)
+
+
 def run_curator_review(
     on_summary: Optional[Callable[[str], None]] = None, synchronous: bool = False,
     dry_run: bool = False, consolidate: Optional[bool] = None, trigger: str = "manual",
@@ -928,6 +947,7 @@ def run_curator_review(
     if dry_run:  # count candidates without mutating state
         counts = {"checked": len(_safe_curated_report()), "marked_stale": 0, "archived": 0, "reactivated": 0}
     else:
+        _git_commit_skills(f"pre-curator-run {start.isoformat()} (trigger={trigger})")
         from agent import curator_backup
         # The prune-only pass just renames directories into .archive/ (its own undo) and every edit is
         # ledgered; only the LLM consolidation pass rewrites content in place, so only it earns a
@@ -982,6 +1002,8 @@ def run_curator_review(
             logger.debug("Curator report write failed: %s", e, exc_info=True)
         save_state(state2)
         _record_run_metric(trigger, dry_run, counts, before_report, after_report, llm_meta, hermes_home)
+        if not dry_run:
+            _git_commit_skills(f"post-curator-run {datetime.now(UTC).isoformat()} (trigger={trigger}): {final_summary[:200]}")
         _notify(on_summary, f"curator: {final_summary}")
 
     if synchronous:

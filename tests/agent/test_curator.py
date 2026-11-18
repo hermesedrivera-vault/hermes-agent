@@ -577,6 +577,33 @@ def test_run_review_records_state(curator_env):
     assert state["last_run_summary"] is not None
 
 
+def test_git_snapshot_failure_does_not_block_the_run(curator_env, monkeypatch):
+    """Ed, 2026-11-17/18: the pre/post git-commit snapshots around a curator
+    run (_git_commit_skills) are best-effort. A git repo IS present
+    (skills/.git exists) but the subprocess call itself fails (e.g. git
+    binary missing, disk full, permission error) — the curator pass must
+    still complete, save state, and report a summary; it must never raise."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    (skills_dir / ".git").mkdir()  # make _git_commit_skills think it's a repo
+    _write_skill(skills_dir, "a")
+    u.mark_agent_created("a")
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("git binary not found")
+
+    monkeypatch.setattr("subprocess.run", _boom)
+
+    # Must not raise.
+    result = c.run_curator_review(synchronous=True)
+    assert "started_at" in result
+    state = c.load_state()
+    assert state["last_run_at"] is not None
+    assert state["run_count"] >= 1
+    assert state["last_run_summary"] is not None
+
+
 
 
 def test_dry_run_injects_report_only_banner(curator_env, monkeypatch):
