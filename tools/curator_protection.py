@@ -91,10 +91,46 @@ def _weakened(old_text: str, new_text: str) -> Optional[str]:
     return None
 
 
+def _curator_is_paused() -> bool:
+    """True if `hermes curator pause` is in effect. Checked HERE — the single
+    skill-write chokepoint — rather than only in agent/curator.py's own
+    scheduler (``maybe_run_curator``/``should_run_now``), because a SECOND,
+    independent subsystem (agent/background_review.py's per-turn nudge,
+    default every 10 turns via `skills.creation_nudge_interval`) sets the
+    exact same ``background_review`` write-origin tag and has NO relationship
+    to curator.pause at all. Checking it here means the pause blocks every
+    automated actor that routes through this gate — the scheduled curator
+    consolidation pass, the per-turn background-review nudge, and any future
+    session-end review — not just the literal ledger actor string "curator".
+    A write Ed has explicitly approved goes through the SEPARATE
+    ``_skill_gate_bypass``/``apply_skill_pending`` replay path in
+    skill_manager_tool.py, which returns before this function is ever called
+    — so an approved write is never blocked by pause.
+
+    Ed, 2026-11-18, after a write landed on jnc-tax-engine-ops while the
+    curator was paused — traced to the per-turn nudge, not the curator's own
+    scheduled pass (confirmed by three more such writes landing mid-
+    investigation, all while paused).
+
+    Fails closed: an error or corrupt state reading pause status is treated
+    as paused (route to proposal), never as unpaused — the safe failure for
+    an approval gate is to hold the write, never to silently let it through.
+    """
+    try:
+        from agent.curator import is_paused
+        return bool(is_paused())
+    except Exception:
+        return True
+
+
 def classify_write(name: str, action: str, *, content: str = "", old_string: str = "",
                     new_string: str = "", file_content: str = "", file_path: str = "") -> Optional[str]:
     """Return a human-readable reason to route this write to a proposal, or
     None if it may proceed through the normal (auto-apply + ledger) path."""
+    if _curator_is_paused():
+        return ("curator is paused (hermes curator pause) — no background-review skill "
+                "write (scheduled curator pass, per-turn nudge, or any future session-end "
+                "review) may land while paused")
     if is_protected_skill(name):
         return f"skill '{name}' is on the protected list (authorization/production-risk content)"
     new_text = content or new_string or file_content or ""

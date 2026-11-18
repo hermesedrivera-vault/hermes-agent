@@ -172,3 +172,115 @@ def test_foreground_write_is_unaffected(tmp_path, hermes_home):
     # Live file WAS updated (foreground writes are not gated by this check).
     content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
     assert "Once authorized the exception stands" in content
+
+
+# ---------------------------------------------------------------------------
+# Pause-aware gating — Ed/Claude, 2026-11-18, after a write landed on
+# jnc-tax-engine-ops while `hermes curator pause` was in effect. Traced to
+# agent/background_review.py's per-turn nudge, a SEPARATE subsystem from
+# agent/curator.py's scheduled pass, with zero reference to curator.pause.
+# The fix: curator_protection.classify_write() checks pause itself, so it
+# blocks every automated actor routing through this one gate (scheduled
+# curator, per-turn nudge, any future session-end review) — not just the
+# literal ledger actor string "curator".
+# ---------------------------------------------------------------------------
+
+def test_session_end_review_write_refused_while_paused(tmp_path, hermes_home, monkeypatch):
+    """(a) A background-review-origin write — standing in for the per-turn
+    nudge / session-end review path, not just the scheduled curator pass —
+    is refused while curator.pause is in effect, even for UNPROTECTED,
+    keyword-free content that would otherwise sail through."""
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(UNLISTED_SKILL_CONTENT, encoding="utf-8")
+
+    monkeypatch.setattr("agent.curator.is_paused", lambda: True)
+
+    with _skill_dir(tmp_path), _as_background_review():
+        raw = skill_manage(
+            action="patch", name="some-ops-skill",
+            old_string="Only when Ed explicitly says go should you proceed.",
+            new_string="Only when Ed explicitly says go should you proceed, plus a benign clarification.",
+        )
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result.get("live_write") is False
+    assert "paused" in result["message"].lower()
+    assert len(list(_proposals_dir(hermes_home).glob("*.md"))) == 1
+    # Live file untouched — pause blocks it before any content classification runs.
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == UNLISTED_SKILL_CONTENT
+
+
+def test_protected_content_refused_without_approval_even_when_not_paused(tmp_path, hermes_home, monkeypatch):
+    """(b) A write to protected content is refused without Ed's explicit
+    approval REGARDLESS of pause state — explicitly confirm the protected-
+    skill gate still fires when curator.is_paused() is False, so the pause
+    check isn't masking a separate, independently-required gate."""
+    monkeypatch.setattr("agent.curator.is_paused", lambda: False)
+
+    skill_dir = tmp_path / "jnc-tax-engine-ops"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(PROTECTED_SKILL_CONTENT, encoding="utf-8")
+
+    with _skill_dir(tmp_path), _as_background_review():
+        raw = skill_manage(
+            action="patch", name="jnc-tax-engine-ops",
+            old_string="Do not deviate from the sequence below without explicit re-authorization.",
+            new_string="Once authorized the exception stands for future reruns without asking again.",
+        )
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result.get("live_write") is False
+    assert "paused" not in result["message"].lower()
+    assert "protected list" in result["message"].lower()
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == PROTECTED_SKILL_CONTENT
+
+
+def test_unreadable_pause_state_fails_closed_and_is_refused(tmp_path, hermes_home, monkeypatch):
+    """(c) An unreadable/corrupt pause state (agent.curator.is_paused raising)
+    must fail CLOSED — treated as paused, write refused — never as unpaused."""
+    def _boom():
+        raise OSError("corrupt .curator_state")
+    monkeypatch.setattr("agent.curator.is_paused", _boom)
+
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(UNLISTED_SKILL_CONTENT, encoding="utf-8")
+
+    with _skill_dir(tmp_path), _as_background_review():
+        raw = skill_manage(
+            action="patch", name="some-ops-skill",
+            old_string="Only when Ed explicitly says go should you proceed.",
+            new_string="Only when Ed explicitly says go should you proceed, plus a benign clarification.",
+        )
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result.get("live_write") is False
+    assert len(list(_proposals_dir(hermes_home).glob("*.md"))) == 1
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == UNLISTED_SKILL_CONTENT
+
+
+def test_normal_unprotected_write_applies_when_not_paused(tmp_path, hermes_home, monkeypatch):
+    """(d) A normal, unprotected, non-weakening background-review write goes
+    through live (no proposal) when curator is confirmed NOT paused."""
+    monkeypatch.setattr("agent.curator.is_paused", lambda: False)
+
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(UNLISTED_SKILL_CONTENT, encoding="utf-8")
+
+    from tools.skill_manager_guards import mark_background_review_skill_read
+
+    with _skill_dir(tmp_path), _as_background_review():
+        mark_background_review_skill_read(skill_dir / "SKILL.md")
+        raw = skill_manage(
+            action="patch", name="some-ops-skill",
+            old_string="Only when Ed explicitly says go should you proceed.",
+            new_string="Only when Ed explicitly says go should you proceed. Also run the lint step first.",
+        )
+    result = json.loads(raw)
+    assert result["success"] is True, raw
+    assert "proposed" not in result
+    assert not list(_proposals_dir(hermes_home).glob("*.md"))
+    content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert "Also run the lint step first." in content
