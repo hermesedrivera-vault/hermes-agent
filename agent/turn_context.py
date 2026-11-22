@@ -34,6 +34,7 @@ from agent.model_metadata import (
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
 from agent.turn_author import parse_turn_author
+from tools.skill_provenance import reset_current_write_origin
 
 logger = logging.getLogger(__name__)
 
@@ -1033,6 +1034,24 @@ def _persist_turn_start(
     )
 
 
+def release_turn_write_origin(agent) -> None:
+    """Hand the caller's skill write-origin back unchanged for this ``agent``'s current turn,
+    success or error. Call exactly once, in a ``finally``, from the function that owns the
+    turn's lifetime (``agent.conversation_loop.run_conversation``) — that way a nested inline
+    turn (compression fork, background review, curator) always restores exactly what was active
+    before it started, by contextvars Token semantics, regardless of how deep the nesting goes.
+
+    Never replace this with a test-only autouse fixture that resets the origin on every test
+    boundary instead: that hides a real production leak rather than fixing it. The only correct
+    fix is pairing every ``set_current_write_origin`` the prologue performs (below) with exactly
+    one call here from the turn's owner.
+    """
+    token = getattr(agent, "_pending_write_origin_token", None)
+    if token is not None:
+        agent._pending_write_origin_token = None
+        reset_current_write_origin(token)
+
+
 def build_turn_context(
     agent, user_message: Any, system_message: Optional[str],
     conversation_history: Optional[list[dict[str, Any]]], task_id: Optional[str], stream_callback,
@@ -1073,7 +1092,15 @@ def build_turn_context(
     # client-managed history, which then trips the "stored system prompt is null; rebuilding from scratch"
     # warning and a needless first-turn prefix cache miss. (Issue #45499.)
     set_session_context(agent.session_id)
-    set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    # Stash the token immediately (atomic with the .set() call, nothing can intervene) so
+    # run_conversation()'s finally can hand the caller's prior origin back unchanged when this
+    # turn ends, success or error — including a nested inline turn (compression fork, background
+    # review, curator) whose token must restore exactly what was active before it started.
+    # Never add a test-only autouse fixture to reset this instead: that would hide a real leak,
+    # not fix it (see tools/skill_provenance.py's docstring and conversation_loop.run_conversation).
+    agent._pending_write_origin_token = set_current_write_origin(
+        getattr(agent, "_memory_write_origin", "assistant_tool")
+    )
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
     agent._restore_primary_runtime()

@@ -34,7 +34,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from agent.turn_context import PreflightCompressionTimedOut, build_turn_context, release_turn_write_origin
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_scripted_prelude import Prelude, play_prelude
@@ -1835,6 +1835,11 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            # Hand the caller's write-origin back unchanged, success or error — including a
+            # nested inline turn (compression fork, background review, curator). See
+            # agent.turn_context.release_turn_write_origin for why this must never be replaced
+            # by a test-only autouse fixture.
+            release_turn_write_origin(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
