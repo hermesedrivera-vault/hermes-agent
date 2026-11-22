@@ -56,6 +56,16 @@ WEAKEN_PATTERNS = (
 )
 
 
+class ProtectionConfigError(Exception):
+    """Raised by ``_cfg_list`` when the config can't be loaded, or
+    ``curator.protected_skills`` / ``curator.protected_keywords`` is present but not a list
+    of strings. ``classify_write`` catches this and routes EVERY background-review write to
+    a proposal (Ed, 2026-11-22) — the previous behavior silently fell back to the code
+    defaults on any error, which meant a broken or malformed config quietly lost whatever
+    deployment-specific protections it was supposed to add, with no signal that it had
+    happened."""
+
+
 def _cfg_list(key: str, default: tuple[str, ...]) -> list[str]:
     """Config entries ADD to the code defaults — never replace them (Ed,
     2026-11-21). A deployment's config.yaml lists only its OWN
@@ -63,17 +73,27 @@ def _cfg_list(key: str, default: tuple[str, ...]) -> list[str]:
     skill); the generic defaults (``hermes-agent``, ``authoriz``, etc.) stay
     protected regardless of what config.yaml says, since a deployment that
     forgets to list them in config should not lose protection it never had
-    to opt into in the first place."""
-    extra: list[str] = []
+    to opt into in the first place.
+
+    Fails closed (Ed, 2026-11-22): a config that can't be loaded at all, or whose
+    ``curator.<key>`` is present but isn't a list of strings, raises
+    ``ProtectionConfigError`` rather than silently falling back to just the code defaults.
+    A KEY THAT IS SIMPLY ABSENT (nothing configured) is not an error — that's the normal
+    "no deployment-specific additions" case and still returns the code defaults.
+    """
     try:
         from hermes_cli.config import load_config_readonly
         from agent.curator import _subdict  # reuse the existing nested-dict helper
         cfg = _subdict(load_config_readonly(), "curator")
-        value = cfg.get(key)
-        if isinstance(value, list) and all(isinstance(v, str) for v in value):
-            extra = [v.strip() for v in value if v.strip()]
-    except Exception:
-        pass
+    except Exception as e:
+        raise ProtectionConfigError(f"config could not be loaded: {e}") from e
+    value = cfg.get(key)
+    extra: list[str] = []
+    if value is not None:
+        if not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+            raise ProtectionConfigError(
+                f"curator.{key} is present but is not a list of strings: {value!r}")
+        extra = [v.strip() for v in value if v.strip()]
     merged = list(default)
     seen = {d.lower() for d in merged}
     for item in extra:
@@ -160,10 +180,9 @@ def _curator_is_paused() -> bool:
     skill_manager_tool.py, which returns before this function is ever called
     — so an approved write is never blocked by pause.
 
-    Ed, 2026-11-18, after a write landed on jnc-tax-engine-ops while the
-    curator was paused — traced to the per-turn nudge, not the curator's own
-    scheduled pass (confirmed by three more such writes landing mid-
-    investigation, all while paused).
+    Ed, 2026-11-18, after a write landed on a protected skill while the curator was
+    paused — traced to the per-turn nudge, not the curator's own scheduled pass
+    (confirmed by three more such writes landing mid-investigation, all while paused).
 
     Reads ``.curator_state`` directly via ``_read_pause_state_from_disk``
     (Ed, 2026-11-21) rather than ``agent.curator.is_paused()`` — that
@@ -195,11 +214,18 @@ def classify_write(name: str, action: str, *, content: str = "", old_string: str
         return (f"action '{action}' from background review always routes to a proposal — "
                 "destructive skill-library changes (deleting a skill or a supporting file) "
                 "are never auto-applied, regardless of skill, keyword, or weaken-pattern checks")
-    if is_protected_skill(name):
+    try:
+        skills = protected_skills()
+        keywords = protected_keywords()
+    except ProtectionConfigError as e:
+        return (f"protection config unreadable ({e}) — curator.protected_skills / "
+                "curator.protected_keywords could not be validated, so this write is "
+                "proposed rather than risk silently losing deployment-specific protection")
+    if (name or "").strip().lower() in {s.lower() for s in skills}:
         return f"skill '{name}' is on the protected list (authorization/production-risk content)"
     new_text = content or new_string or file_content or ""
     old_text = old_string or ""
-    kw = _contains_any_keyword(new_text, protected_keywords())
+    kw = _contains_any_keyword(new_text, keywords)
     if kw:
         return f"write introduces protected-content keyword '{kw}'"
     weak = _weakened(old_text, new_text)

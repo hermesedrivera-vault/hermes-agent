@@ -657,3 +657,105 @@ def test_config_protected_skills_adds_to_defaults_not_replaces(tmp_path, hermes_
     assert "enforced-gmail-send" in protected  # another code default, not dropped
     assert cp.is_protected_skill("jnc-tax-engine-ops")
     assert cp.is_protected_skill("hermes-agent")
+
+
+# ---------------------------------------------------------------------------
+# Claude review round 1 (Ed, 2026-11-22): config fails closed. A curator.<key>
+# config that can't be loaded, or is present but not a list of strings, must
+# not silently fall back to the code defaults -- classify_write() must return
+# a reason so EVERY background-review write is proposed until the config is
+# fixed. A valid config keeps today's behavior unchanged.
+# ---------------------------------------------------------------------------
+
+def test_malformed_config_fails_closed_and_proposes_every_background_write(
+        tmp_path, hermes_home, monkeypatch):
+    """curator.protected_skills present but not a list of strings -> classify_write()
+    returns a 'protection config unreadable' reason, even for a write that would
+    otherwise be entirely unremarkable (unlisted skill, no keyword, no weaken pattern)."""
+    from tools import curator_protection as cp
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"curator": {"protected_skills": "not-a-list"}})
+
+    with pytest.raises(cp.ProtectionConfigError):
+        cp.protected_skills()
+
+    reason = cp.classify_write(
+        "some-ops-skill", "patch", old_string="anything", new_string="anything else")
+    assert reason is not None
+    assert "protection config unreadable" in reason
+
+
+def test_config_that_cannot_be_loaded_fails_closed(tmp_path, hermes_home, monkeypatch):
+    """load_config_readonly() itself raising (not just a malformed value) is the same
+    fail-closed case -- the old code's bare `except Exception: pass` treated this
+    identically to 'nothing configured' and silently used only the code defaults."""
+    from tools import curator_protection as cp
+
+    def _boom():
+        raise OSError("config.yaml: permission denied")
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _boom)
+
+    reason = cp.classify_write(
+        "some-ops-skill", "patch", old_string="anything", new_string="anything else")
+    assert reason is not None
+    assert "protection config unreadable" in reason
+
+
+def test_malformed_config_routes_the_real_write_through_skill_manage_to_a_proposal(
+        tmp_path, hermes_home, monkeypatch):
+    """End to end through skill_manage(): a malformed config must not let an otherwise
+    unremarkable background-review write land live."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"curator": {"protected_keywords": {"not": "a-list"}}})
+
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(UNLISTED_SKILL_CONTENT, encoding="utf-8")
+
+    from tools.skill_manager_guards import mark_background_review_skill_read
+
+    with _skill_dir(tmp_path), _as_background_review():
+        mark_background_review_skill_read(skill_dir / "SKILL.md")
+        raw = skill_manage(
+            action="patch", name="some-ops-skill",
+            old_string="Only when Ed explicitly says go should you proceed.",
+            new_string="Proceed whenever it looks ready.",
+        )
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result.get("live_write") is False
+    assert result.get("proposed") is True
+    assert "protection config unreadable" in result["message"]
+    # Live file WAS NOT updated.
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == UNLISTED_SKILL_CONTENT
+
+
+def test_valid_config_keeps_todays_behavior(tmp_path, hermes_home, monkeypatch):
+    """A well-formed config (the normal case) is unaffected by the fail-closed change:
+    an unlisted skill with no keyword/weaken hit still applies live."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"curator": {"protected_skills": [], "protected_keywords": []}})
+
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    plain_content = "---\nname: some-ops-skill\ndescription: Nothing special.\n---\n\nBody.\n"
+    (skill_dir / "SKILL.md").write_text(plain_content, encoding="utf-8")
+
+    from tools.skill_manager_guards import mark_background_review_skill_read
+
+    with _skill_dir(tmp_path), _as_background_review():
+        mark_background_review_skill_read(skill_dir / "SKILL.md")
+        raw = skill_manage(
+            action="patch", name="some-ops-skill",
+            old_string="Body.", new_string="Updated body.",
+        )
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert "proposed" not in result  # normal write-result shape, not the gate's shape
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == plain_content.replace(
+        "Body.", "Updated body.")
