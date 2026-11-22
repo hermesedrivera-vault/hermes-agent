@@ -229,8 +229,19 @@ def test_protected_content_refused_without_approval_even_when_not_paused(tmp_pat
     approval REGARDLESS of pause state — explicitly confirm the protected-
     skill gate still fires with no .curator_state file at all (missing file
     -> not paused), so the pause check isn't masking a separate,
-    independently-required gate."""
+    independently-required gate.
+
+    B8 moved 'jnc-tax-engine-ops' out of the code defaults into
+    config.yaml's curator.protected_skills (it's deployment-specific). This
+    test writes a REAL config.yaml under the isolated HERMES_HOME and loads
+    it through the real config path (no mocking of
+    curator_protection.protected_skills) — exercising B8's additive merge
+    (config entries add to the code defaults) end to end, the way it
+    actually runs in production."""
     assert not _state_path(hermes_home).exists()
+
+    (hermes_home / "config.yaml").write_text(
+        "curator:\n  protected_skills:\n    - jnc-tax-engine-ops\n", encoding="utf-8")
 
     skill_dir = tmp_path / "jnc-tax-engine-ops"
     skill_dir.mkdir()
@@ -503,17 +514,30 @@ def test_full_rewrite_write_file_weaken_pattern_detected_via_current_file(tmp_pa
 def test_delete_from_background_review_always_proposed(tmp_path, hermes_home):
     """action='delete' from background review always routes to a proposal —
     never auto-archived/deleted — even for an unprotected skill with no
-    weaken pattern or protected keyword at all."""
+    weaken pattern or protected keyword at all.
+
+    Must be a curator-managed skill (a usage record with created_by="agent")
+    to get past an EARLIER, pre-existing, unrelated ownership guard
+    (_background_review_delete_guard, checked before this gate even runs) —
+    that guard refuses a non-curator-managed delete outright (correct,
+    separate, pre-existing behavior); this test is about what happens to a
+    delete that DOES pass ownership."""
     skill_dir = tmp_path / "some-ops-skill"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text(
         "---\nname: some-ops-skill\ndescription: An unlisted ops skill.\n---\n\nBenign content.\n",
         encoding="utf-8")
 
+    from tools import skill_usage
+    data = skill_usage.load_usage()
+    data["some-ops-skill"] = skill_usage._empty_record()
+    data["some-ops-skill"]["created_by"] = "agent"
+    skill_usage.save_usage(data)
+
     with _skill_dir(tmp_path), _as_background_review():
         raw = skill_manage(action="delete", name="some-ops-skill")
     result = json.loads(raw)
-    assert result["success"] is True
+    assert result["success"] is True, raw
     assert result.get("live_write") is False
     assert "proposal" in result["message"].lower()
     assert skill_dir.exists()  # never archived or removed
