@@ -1045,11 +1045,28 @@ def release_turn_write_origin(agent) -> None:
     boundary instead: that hides a real production leak rather than fixing it. The only correct
     fix is pairing every ``set_current_write_origin`` the prologue performs (below) with exactly
     one call here from the turn's owner.
+
+    Never raises (Ed, 2026-11-22, Claude review round 1 item 2): ``ContextVar.reset()`` can raise
+    ``ValueError`` (the token was already used to reset once) or ``RuntimeError`` (the token was
+    created in a different ``Context`` than the one it's being reset in — e.g. a turn whose work
+    hopped threads). Either is logged as a warning and swallowed; a failed origin-reset must
+    never fail the turn itself or mask whatever original exception the turn's own ``try`` block
+    is already propagating out of the ``finally``.
     """
     token = getattr(agent, "_pending_write_origin_token", None)
-    if token is not None:
-        agent._pending_write_origin_token = None
+    if token is None:
+        return
+    agent._pending_write_origin_token = None
+    try:
         reset_current_write_origin(token)
+    except (ValueError, RuntimeError):
+        logger.warning(
+            "release_turn_write_origin: reset_current_write_origin failed for session=%s "
+            "(token already used, or used outside the Context it was created in) -- the "
+            "turn's write-origin may remain set to this turn's value for whatever runs next "
+            "in this thread; not re-raising so this never masks the turn's own exception.",
+            getattr(agent, "session_id", None), exc_info=True,
+        )
 
 
 def build_turn_context(

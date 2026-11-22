@@ -100,6 +100,72 @@ def test_nested_inline_turn_restores_callers_origin_and_foreground_write_applies
     assert get_current_write_origin() == "foreground"  # ContextVar default, nothing left dangling
 
 
+def test_release_turn_write_origin_never_raises_on_a_reused_token(caplog):
+    """reset_current_write_origin() can raise (token already used, or used outside the
+    Context it was created in) -- release_turn_write_origin() must swallow that and log a
+    warning rather than raising, so a failed reset never fails the turn or masks whatever
+    real exception the turn's own try block is already propagating."""
+    agent = _FakeAgent()
+    agent._memory_write_origin = "foreground"
+    _run_turn_real_origin(agent)
+    assert get_current_write_origin() == "foreground"
+
+    # First release is the normal, successful path.
+    release_turn_write_origin(agent)
+    assert get_current_write_origin() == "foreground"
+
+    # Simulate a second, stale token still sitting on `agent` (e.g. a bug elsewhere leaves
+    # the attribute set after it was already consumed) -- reset() on an already-used token
+    # raises RuntimeError. This must not propagate.
+    agent._memory_write_origin = "background_review"
+    _run_turn_real_origin(agent)
+    stale_token = agent._pending_write_origin_token
+    release_turn_write_origin(agent)  # consumes it normally
+    agent._pending_write_origin_token = stale_token  # put the now-used token back
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        release_turn_write_origin(agent)  # must not raise
+    assert any("reset_current_write_origin failed" in r.message for r in caplog.records)
+    assert agent._pending_write_origin_token is None
+
+
+def test_real_run_conversation_restores_callers_origin_when_the_turn_raises(monkeypatch):
+    """Goes through the REAL agent.conversation_loop.run_conversation() (not a copy of its
+    finally logic) with a turn body that raises, and asserts the caller's prior origin is
+    restored. Only ``_run_conversation_turn`` (the inner turn body) is stubbed, to a function
+    that reproduces the real build_turn_context()'s prologue side effect -- binding the
+    origin and stashing its token on `agent` -- before raising, mirroring a turn that fails
+    after build_turn_context() already ran (e.g. a PreflightCompressionTimedOut deeper in
+    the turn, or any other exception mid-turn)."""
+    from agent import conversation_loop as cl
+
+    outer = _FakeAgent()
+    outer._memory_write_origin = "foreground"
+    _run_turn_real_origin(outer)
+    assert get_current_write_origin() == "foreground"
+
+    inner = _FakeAgent()
+    inner._memory_write_origin = "background_review"
+
+    def _boom_turn(agent, *_a, **_kw):
+        agent._pending_write_origin_token = set_current_write_origin(agent._memory_write_origin)
+        assert get_current_write_origin() == "background_review"
+        raise RuntimeError("nested turn blew up mid-tool-call")
+
+    monkeypatch.setattr(cl, "_run_conversation_turn", _boom_turn)
+
+    with pytest.raises(RuntimeError, match="blew up"):
+        cl.run_conversation(inner, "hello")
+
+    # run_conversation()'s own finally released inner's origin even though the turn body
+    # raised -- the outer (still mid-turn) origin comes back unchanged.
+    assert get_current_write_origin() == "foreground"
+
+    release_turn_write_origin(outer)
+    assert get_current_write_origin() == "foreground"
+
+
 def test_nested_inline_turn_that_raises_still_restores_callers_origin():
     """Same scenario, but the nested turn raises -- the caller's origin must still come back,
     mirroring agent.conversation_loop.run_conversation's finally (always releases, error or not)."""
