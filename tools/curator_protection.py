@@ -57,16 +57,30 @@ WEAKEN_PATTERNS = (
 
 
 def _cfg_list(key: str, default: tuple[str, ...]) -> list[str]:
+    """Config entries ADD to the code defaults — never replace them (Ed,
+    2026-11-21). A deployment's config.yaml lists only its OWN
+    deployment-specific additions (e.g. a client name or a project-specific
+    skill); the generic defaults (``hermes-agent``, ``authoriz``, etc.) stay
+    protected regardless of what config.yaml says, since a deployment that
+    forgets to list them in config should not lose protection it never had
+    to opt into in the first place."""
+    extra: list[str] = []
     try:
         from hermes_cli.config import load_config_readonly
         from agent.curator import _subdict  # reuse the existing nested-dict helper
         cfg = _subdict(load_config_readonly(), "curator")
         value = cfg.get(key)
         if isinstance(value, list) and all(isinstance(v, str) for v in value):
-            return [v.strip() for v in value if v.strip()]
+            extra = [v.strip() for v in value if v.strip()]
     except Exception:
         pass
-    return list(default)
+    merged = list(default)
+    seen = {d.lower() for d in merged}
+    for item in extra:
+        if item.lower() not in seen:
+            merged.append(item)
+            seen.add(item.lower())
+    return merged
 
 
 def protected_skills() -> list[str]:
