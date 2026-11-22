@@ -759,3 +759,73 @@ def test_valid_config_keeps_todays_behavior(tmp_path, hermes_home, monkeypatch):
     assert "proposed" not in result  # normal write-result shape, not the gate's shape
     assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == plain_content.replace(
         "Body.", "Updated body.")
+
+
+# ---------------------------------------------------------------------------
+# Claude review round 1 (Ed, 2026-11-22), item 3: _current_content_for_weaken_check
+# must return "" only when the target file doesn't exist. An EXISTING file that can't
+# be read must raise, so the gate refuses closed instead of silently comparing against
+# an empty string (which could let a weaken-pattern removal on an unreadable file slip
+# through undetected).
+# ---------------------------------------------------------------------------
+
+def test_weaken_check_raises_on_an_existing_but_unreadable_file(tmp_path, hermes_home):
+    from tools.skill_manager_tool import _current_content_for_weaken_check
+
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(UNLISTED_SKILL_CONTENT, encoding="utf-8")
+    os.chmod(skill_md, 0o000)
+    try:
+        with _skill_dir(tmp_path):
+            with pytest.raises(OSError):
+                _current_content_for_weaken_check("some-ops-skill", "edit", None)
+    finally:
+        os.chmod(skill_md, 0o644)  # restore so pytest's tmp_path cleanup can remove it
+
+
+def test_weaken_check_returns_empty_string_when_the_file_simply_does_not_exist(tmp_path, hermes_home):
+    """The file-not-found case stays the normal, non-error '' -- only a READ failure on an
+    EXISTING file is new behavior."""
+    from tools.skill_manager_tool import _current_content_for_weaken_check
+
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    # No SKILL.md written at all.
+    with _skill_dir(tmp_path):
+        assert _current_content_for_weaken_check("some-ops-skill", "edit", None) == ""
+    # An unknown skill name (nothing to find at all) is also still "".
+    with _skill_dir(tmp_path):
+        assert _current_content_for_weaken_check("does-not-exist", "edit", None) == ""
+
+
+def test_unreadable_existing_file_refuses_the_write_closed_through_skill_manage(
+        tmp_path, hermes_home):
+    """End to end through skill_manage(): a background-review full-rewrite (``edit``,
+    no old_string supplied) against a SKILL.md that exists but can't be read must refuse
+    the write outright (success: False) -- never silently apply it live as if the file
+    had been empty."""
+    skill_dir = tmp_path / "some-ops-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(UNLISTED_SKILL_CONTENT, encoding="utf-8")
+    os.chmod(skill_md, 0o000)
+
+    from tools.skill_manager_guards import mark_background_review_skill_read
+
+    try:
+        with _skill_dir(tmp_path), _as_background_review():
+            mark_background_review_skill_read(skill_md)
+            raw = skill_manage(
+                action="edit", name="some-ops-skill",
+                content="---\nname: some-ops-skill\ndescription: An unlisted ops skill.\n---\n\nReplaced.\n",
+            )
+    finally:
+        os.chmod(skill_md, 0o644)
+
+    result = json.loads(raw)
+    assert result["success"] is False
+    assert result.get("live_write") is False
+    # Live file WAS NOT updated (still exactly the original content, permissions restored).
+    assert skill_md.read_text(encoding="utf-8") == UNLISTED_SKILL_CONTENT

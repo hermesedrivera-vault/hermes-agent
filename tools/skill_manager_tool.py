@@ -681,26 +681,33 @@ def _current_content_for_weaken_check(name: str, action: str, file_path: Optiona
     without this, a curator full-rewrite could silently drop a guardrail
     phrase with no 'before' text to compare against, since
     ``classify_write``'s weaken check would always see an empty ``old_text``.
-    Swallows errors (returns "") rather than blocking the write on a routine
-    read failure; the write is still gated by everything else in
-    ``classify_write``.
+
+    Returns ``""`` ONLY when the target file genuinely doesn't exist (the skill isn't
+    found, the action doesn't target a file this check applies to, or the resolved path
+    itself doesn't exist) — that's the normal "nothing to compare against" case, not an
+    error. An EXISTING file that can't be READ (permission error, OSError, a decode
+    failure) now RAISES instead of being swallowed into the same ``""`` (Ed, 2026-11-22,
+    Claude review round 1 item 3): the caller, ``_apply_skill_write_gate``, already wraps
+    this whole branch in a try/except that refuses the write closed on any exception — the
+    old behavior of silently returning ``""`` on a read failure meant a weaken-pattern
+    removal on a file Python simply couldn't read would compare against an empty string
+    and never be detected, exactly the failure mode this gate exists to catch.
     """
     existing = _find_skill(name)
     if not existing:
         return ""
     skill_dir = existing["path"]
-    try:
-        if action == "edit":
-            target = skill_dir / "SKILL.md"
-        elif action == "write_file" and file_path:
-            target, err = _resolve_supporting_file(skill_dir, file_path)
-            if err or target is None:
-                return ""
-        else:
+    if action == "edit":
+        target = skill_dir / "SKILL.md"
+    elif action == "write_file" and file_path:
+        target, err = _resolve_supporting_file(skill_dir, file_path)
+        if err or target is None:
             return ""
-        return target.read_text(encoding="utf-8-sig") if target.exists() else ""
-    except Exception:
+    else:
         return ""
+    if not target.exists():
+        return ""
+    return target.read_text(encoding="utf-8-sig")
 
 
 def _apply_skill_write_gate(action, name, **payload_kwargs):
