@@ -217,6 +217,35 @@ def test_pinned_skill_is_never_touched(curator_env):
     assert rec["pinned"] is True
 
 
+def test_protected_skill_is_never_auto_archived(curator_env, monkeypatch):
+    """B5: a skill on curator_protection's protected list is skipped by
+    apply_automatic_transitions exactly like a pinned skill — the curator
+    can never archive protected content via the deterministic inactivity
+    prune, even though it isn't individually pinned."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    _write_skill(skills_dir, "precious2")
+
+    from tools import curator_protection as cp
+    monkeypatch.setattr(cp, "protected_skills", lambda: ["precious2"])
+
+    super_old = (datetime.now(UTC) - timedelta(days=365)).isoformat()
+    data = u.load_usage()
+    data["precious2"] = u._empty_record()
+    data["precious2"]["created_by"] = "agent"
+    data["precious2"]["last_used_at"] = super_old
+    data["precious2"]["created_at"] = super_old
+    u.save_usage(data)
+
+    counts = c.apply_automatic_transitions()
+    assert counts["archived"] == 0
+    assert counts["marked_stale"] == 0
+    rec = u.get_record("precious2")
+    assert rec["state"] == "active"  # untouched
+    assert rec.get("pinned") is not True  # protected via content list, not pinning
+
+
 
 
 
