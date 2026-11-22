@@ -673,27 +673,88 @@ def _run_write_gate(build_staging):
                        "gist": gist, "message": decision.message}, ensure_ascii=False)
 
 
+def _current_content_for_weaken_check(name: str, action: str, file_path: Optional[str]) -> str:
+    """Best-effort: the current on-disk content of the target file, used as
+    ``old_text`` for the weaken-pattern check on a full rewrite (``edit``
+    replaces all of SKILL.md; ``write_file`` replaces all of one supporting
+    file). Unlike ``patch``, these callers don't supply ``old_string`` —
+    without this, a curator full-rewrite could silently drop a guardrail
+    phrase with no 'before' text to compare against, since
+    ``classify_write``'s weaken check would always see an empty ``old_text``.
+    Swallows errors (returns "") rather than blocking the write on a routine
+    read failure; the write is still gated by everything else in
+    ``classify_write``.
+    """
+    existing = _find_skill(name)
+    if not existing:
+        return ""
+    skill_dir = existing["path"]
+    try:
+        if action == "edit":
+            target = skill_dir / "SKILL.md"
+        elif action == "write_file" and file_path:
+            target, err = _resolve_supporting_file(skill_dir, file_path)
+            if err or target is None:
+                return ""
+        else:
+            return ""
+        return target.read_text(encoding="utf-8-sig") if target.exists() else ""
+    except Exception:
+        return ""
+
+
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Flat-shape gate: stage the full kwargs so approval can replay them; bypassed during replay.
 
     Protected-content gate (Ed, 2026-11-17, after a curator over-generalization
     incident): a curator (background_review-origin) write that targets a
-    protected skill, introduces a protected-content keyword, or removes/weakens
-    a guardrail phrase never lands live — it is proposed instead, via
-    ``tools.curator_protection``, and the real write handler never runs. This
-    check is independent of ``skills.write_approval`` and applies only to the
-    curator's own fork, not foreground agent or user actions.
+    protected skill, introduces a protected-content keyword, removes/weakens
+    a guardrail phrase, or is a delete/remove_file action never lands live —
+    it is proposed instead, via ``tools.curator_protection``, and the real
+    write handler never runs. This check is independent of
+    ``skills.write_approval`` and applies only to the curator's own fork, not
+    foreground agent or user actions.
+
+    Fails closed (Ed, 2026-11-21): if the write's origin can't be determined,
+    it's treated as background-review, not foreground. If anything inside the
+    background-review branch raises — ``classify_write``, ``write_proposal``,
+    or the best-effort current-content read for a full rewrite — the write is
+    REFUSED outright (``success: False``) and never falls through to the
+    normal write path below. The previous ``with suppress(Exception):``
+    wrapper around this whole section let any such failure silently skip the
+    gate entirely and apply the write live — exactly the failure mode this
+    gate exists to prevent.
     """
     if action not in _ACTION_HANDLERS or _skill_gate_bypass.get():
         return None
-    with suppress(Exception):
+
+    def _staging(wa):
+        payload = {"action": action, "name": name,
+                   **{k: v for k, v in payload_kwargs.items() if v is not None}}
+        gist_kw = {k: payload_kwargs.get(k) or ""
+                   for k in ("content", "file_path", "old_string", "new_string")}
+        return payload, wa.skill_gist(action, name, **gist_kw)
+
+    try:
         from tools.skill_provenance import is_background_review
-        if is_background_review():
+        origin_is_background_review = is_background_review()
+    except Exception:
+        # Can't identify the writer's origin — treat as background-review.
+        # The unsafe failure mode is silently treating an unidentified
+        # automated write as a trusted foreground one.
+        origin_is_background_review = True
+
+    if origin_is_background_review:
+        try:
             from tools import curator_protection as _cp
+            old_text = payload_kwargs.get("old_string") or ""
+            if action in ("edit", "write_file") and not old_text:
+                old_text = _current_content_for_weaken_check(
+                    name, action, payload_kwargs.get("file_path"))
             reason = _cp.classify_write(
-                name, action,
+                name, action, old_string=old_text,
                 **{k: (payload_kwargs.get(k) or "") for k in
-                   ("content", "old_string", "new_string", "file_content", "file_path")})
+                   ("content", "new_string", "file_content", "file_path")})
             if reason:
                 session_id = ""
                 with suppress(Exception):
@@ -708,12 +769,14 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
                     "message": (f"Protected content — proposal filed at {proposal_path}, "
                                 f"NOT applied to the live skill. Reason: {reason}"),
                 }, ensure_ascii=False)
-    def _staging(wa):
-        payload = {"action": action, "name": name,
-                   **{k: v for k, v in payload_kwargs.items() if v is not None}}
-        gist_kw = {k: payload_kwargs.get(k) or ""
-                   for k in ("content", "file_path", "old_string", "new_string")}
-        return payload, wa.skill_gist(action, name, **gist_kw)
+        except Exception as e:
+            return json.dumps({
+                "success": False, "live_write": False,
+                "message": (f"Background-review skill write to '{name}' refused: the "
+                            f"protected-content gate raised an error ({e}). Refusing closed "
+                            f"rather than risk an unguarded write landing live."),
+            }, ensure_ascii=False)
+
     return _run_write_gate(_staging)
 
 

@@ -9,13 +9,17 @@ in this module ever writes to a live skill; ``_apply_skill_write_gate`` in
 ``origin == background_review`` (the curator's own fork).
 
 Added 2026-11-17 after a curator over-generalization incident: an
-unsupervised curator pass loosened an authorization-scope sentence in the
-``jnc-tax-engine-ops`` skill. See the companion vault postmortem
-(``05-Postmortems/2026-11-17-curator-ci-authorization-overgeneralization.md``).
+unsupervised curator pass loosened an authorization-scope sentence in a
+project-specific operations skill. Deployment-specific skill names and
+keywords are NOT hardcoded here (this module ships in a public repo) — add
+them via ``curator.protected_skills`` / ``curator.protected_keywords`` in
+your own ``~/.hermes/config.yaml`` instead. See your own incident notes for
+the specific skill and session involved, if any.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -23,18 +27,21 @@ from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 
-# Whole-skill protection: most of the skill's content is authorization/
-# approval/production-risk guidance, so ANY curator write to it is proposed,
-# never auto-applied. Configurable via config.yaml `curator.protected_skills`.
-DEFAULT_PROTECTED_SKILLS = ("jnc-tax-engine-ops", "enforced-gmail-send", "send-email-tool")
+# Whole-skill protection: generic, deployment-agnostic defaults only — most of
+# each named skill's content is authorization/approval/production-risk
+# guidance, so ANY curator write to it is proposed, never auto-applied.
+# Deployment-specific skills (e.g. a client-specific ops runbook) belong in
+# config.yaml's `curator.protected_skills`, not here.
+DEFAULT_PROTECTED_SKILLS = ("enforced-gmail-send", "send-email-tool", "hermes-agent")
 
 # Content-level protection: a curator write introducing one of these terms is
-# proposed even on a skill not in the list above. Configurable via
+# proposed even on a skill not in the list above. Generic terms only — add
+# deployment-specific terms (client/person names, etc.) via config.yaml's
 # `curator.protected_keywords`.
 DEFAULT_PROTECTED_KEYWORDS = (
     "authoriz", "approv", "merg", "push", "deploy", "rebuild", "migrat",
     "production database", "prod db", "secret", "credential", "api key",
-    "send email", "kenneth", "hitl", "human review", "review gate",
+    "send email", "hitl", "human review", "review gate",
 )
 
 # Guardrail phrases whose REMOVAL (present in the old text, gone/changed in
@@ -91,6 +98,38 @@ def _weakened(old_text: str, new_text: str) -> Optional[str]:
     return None
 
 
+def _read_pause_state_from_disk() -> bool:
+    """Read ``.curator_state`` directly rather than through
+    ``agent.curator.load_state()``, which maps a MISSING file to
+    ``paused: False`` by design but also silently maps a READ/PARSE ERROR to
+    the exact same ``paused: False`` default — exactly backwards for a
+    safety gate, since it means a corrupt state file on disk previously
+    *unblocked* automated writes instead of blocking them, with no exception
+    for ``_curator_is_paused``'s own try/except to ever catch.
+
+    - missing file -> not paused (``False``): nothing has ever paused the
+      curator, so there's nothing to fail closed about.
+    - unreadable file, invalid JSON, a non-dict top level, or a ``paused``
+      value that isn't a ``bool`` -> paused (``True``): anything that can't
+      be cleanly resolved to a real boolean fails closed.
+    """
+    path = get_hermes_home() / "skills" / ".curator_state"
+    if not path.exists():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return True
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(data, dict):
+        return True
+    paused = data.get("paused", False)
+    return True if not isinstance(paused, bool) else paused
+
+
 def _curator_is_paused() -> bool:
     """True if `hermes curator pause` is in effect. Checked HERE — the single
     skill-write chokepoint — rather than only in agent/curator.py's own
@@ -112,13 +151,20 @@ def _curator_is_paused() -> bool:
     scheduled pass (confirmed by three more such writes landing mid-
     investigation, all while paused).
 
-    Fails closed: an error or corrupt state reading pause status is treated
-    as paused (route to proposal), never as unpaused — the safe failure for
-    an approval gate is to hold the write, never to silently let it through.
+    Reads ``.curator_state`` directly via ``_read_pause_state_from_disk``
+    (Ed, 2026-11-21) rather than ``agent.curator.is_paused()`` — that
+    function's own ``load_state()`` swallows read/parse errors into
+    ``paused: False`` internally, so a corrupt state file never raised an
+    exception for this function's try/except to catch; it just silently
+    reported "not paused". Reading the file directly here means a corrupt
+    file genuinely fails closed instead of a false negative.
+
+    Still fails closed on top of that: an error even from the direct-read
+    path (TypeError resolving ``get_hermes_home()``, etc.) is treated as
+    paused (route to proposal), never as unpaused.
     """
     try:
-        from agent.curator import is_paused
-        return bool(is_paused())
+        return _read_pause_state_from_disk()
     except Exception:
         return True
 
@@ -131,6 +177,10 @@ def classify_write(name: str, action: str, *, content: str = "", old_string: str
         return ("curator is paused (hermes curator pause) — no background-review skill "
                 "write (scheduled curator pass, per-turn nudge, or any future session-end "
                 "review) may land while paused")
+    if action in ("delete", "remove_file"):
+        return (f"action '{action}' from background review always routes to a proposal — "
+                "destructive skill-library changes (deleting a skill or a supporting file) "
+                "are never auto-applied, regardless of skill, keyword, or weaken-pattern checks")
     if is_protected_skill(name):
         return f"skill '{name}' is on the protected list (authorization/production-risk content)"
     new_text = content or new_string or file_content or ""
