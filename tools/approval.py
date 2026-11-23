@@ -31,6 +31,7 @@ from tools.approval_context import (
 from tools.approval_detection import (
     _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
 )
+from tools.approval_config_cli import config_cli_gate
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
     _user_deny_block_result,
@@ -1124,6 +1125,9 @@ def check_dangerous_command(command: str, env_type: str,
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
+    blocked = config_cli_gate(command)  # before yolo and the allowlist: asks every time
+    if blocked is not None:
+        return blocked
     if _yolo_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
@@ -1179,6 +1183,10 @@ def check_all_command_guards(command: str, env_type: str,
         return _user_deny_block(command) or _approved()
 
     blocked = _floor_block(command, sudo_guard=True)
+    if blocked is not None:
+        return blocked
+    # Before the prepared batch, yolo, mode=off, the allowlist and the unattended fall-through: asks every time.
+    blocked = config_cli_gate(command)
     if blocked is not None:
         return blocked
 

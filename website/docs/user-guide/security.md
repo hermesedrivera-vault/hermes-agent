@@ -93,6 +93,18 @@ YOLO mode disables **all** dangerous command safety checks for the session — *
 
 For destructive session slash commands (`/clear`, `/new` / `/reset`, `/undo`, `/quit --delete` — `/exit --delete` is an alias), the CLI also prompts for confirmation before running them. See [Slash Commands — Confirmation prompts for destructive commands](../reference/slash-commands.md#confirmation-prompts-for-destructive-commands).
 
+### Hermes config changes from the terminal
+
+`~/.hermes/config.yaml` holds the approval mode, the allowlist and other security
+settings, so the agent's file tools refuse to write it. When the agent runs a
+config-changing CLI command in its terminal (`hermes config set`, `unset`, `edit`
+or `migrate`, in any profile), Hermes asks you every time: the prompt offers only
+**Approve once** or **Deny**, nothing is remembered, and YOLO mode,
+`approvals.mode: off` and the allowlist do not skip it. With no one there to
+answer (cron, an unattended platform), the command is refused. Reading config
+(`hermes config get`, `show`, `check`) is not gated. Like the other approval
+patterns, this catches the CLI, not a script that writes the file itself.
+
 ### Supervised-gateway lifecycle restriction
 
 The terminal tool has a separate, non-overridable guard against stopping or
