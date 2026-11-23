@@ -12,15 +12,18 @@ writes the file itself, ``execute_code`` and input typed into a background shell
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 
 from tools.approval_detection import (
-    _command_detection_variants, _lower_preserving_flags, _mask_quoted_prose, detect_dangerous_command,
+    _command_detection_variants, _deobfuscate_shell_word_for_detection, _iter_shell_command_word_spans,
+    _lower_preserving_flags, _mask_quoted_prose, detect_dangerous_command,
 )
 
-# At most eight global flags (each with an optional value) before the subcommand: Hermes has a handful, and a bound
+# At most eight global flags (each with an optional value, quoted or not: `-p "work"`) before the subcommand: Hermes
+# has a handful, and a bound
 # keeps the scan linear on adversarial input, where an unbounded run from every `hermes` start point is quadratic.
-_FLAGS = r'(?:-\S++(?:\s++(?!-\S)\S++)?\s++){0,8}'
+_FLAGS = r'(?:-\S++(?:\s++(?:["\'][^"\'\n]*+["\']|(?!-\S)\S++))?\s++){0,8}'
 _HERMES = r'\b(?:hermes(?:\.exe)?|hermes_cli(?:[./]main(?:\.py)?)?)\s+' + _FLAGS
 # A verb or subcommand word that is quoted, partly quoted (`s"e"t`) or built at run time (`$(...)`, `${...}`,
 # backticks) counts too: quote-masking blanks it, its value is unknown here, and an extra prompt is cheap.
@@ -28,15 +31,27 @@ _HERMES = r'\b(?:hermes(?:\.exe)?|hermes_cli(?:[./]main(?:\.py)?)?)\s+' + _FLAGS
 _VERB = r'(?:(?:set|unset|edit|migrate)\b|[^\s"\']*["\'$`])'
 _CONFIG_WORD = r'(?:config|[^\s"\']*["\'][^"\'\n]*["\']\S*)'
 _POLICY_WRITE_RE = re.compile(
-    _HERMES + r'(?:' + _CONFIG_WORD + r'\s+' + _VERB + r'|approvals\s+suggest\b[^;|&\n]*--apply\b)'
+    _HERMES + r'(?:' + _CONFIG_WORD + r'\s+' + _VERB + r'|approvals\s+suggest\b[^;|&\n]{0,200}--apply\b)'
 )
-# A command that runs a string as code (`eval`, a shell or interpreter reading -c/stdin, ssh, watch, ...): quoted text
-# in it may execute, so it is matched unmasked. Elsewhere quoted text is data (`git commit -m "...hermes config set..."`,
-# `grep 'hermes config set' docs/`) and is masked first.
-_RUNS_STRINGS_RE = re.compile(
-    r'\b(?:eval|source|bash|sh|zsh|dash|ksh|fish|pwsh|powershell|python[\d.]*|py|perl|ruby|node|deno|bun|php|ssh|'
-    r'watch|su|runuser|script|parallel|xargs|env|tmux|screen)\b'
-)
+# A program in command position that runs a string as code (`eval`, a shell or interpreter reading -c or stdin, ssh,
+# watch, find -exec, ...): quoted text in its command may execute, so the command is matched unmasked. Elsewhere quoted
+# text is data (`git commit -m "...hermes config set..."`, `grep 'hermes config set' tools/*.py`) and is masked first.
+_RUNNERS = frozenset((
+    "eval", "source", ".", "bash", "sh", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd", "cmd.exe",
+    "py", "perl", "ruby", "node", "deno", "bun", "php", "awk", "gawk", "mawk", "vim", "nvim", "ssh", "watch", "su",
+    "runuser", "script", "parallel", "xargs", "env", "tmux", "screen", "flock", "at", "batch", "find",
+    "docker", "podman", "kubectl", "nsenter", "chroot",
+))
+_PYTHON_RE = re.compile(r'python[\d.]*(?:\.exe)?')
+
+
+def _runs_strings(variant: str) -> bool:
+    for _, _, word in _iter_shell_command_word_spans(variant):
+        name = os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower()
+        if name in _RUNNERS or _PYTHON_RE.fullmatch(name):
+            return True
+    return False
+
 
 _DESCRIPTION = (
     "Change Hermes's own configuration (config.yaml holds the approval mode, allowlist and other security "
@@ -61,7 +76,7 @@ def command_mutates_hermes_config(command: str) -> bool:
         lowered = _lower_preserving_flags(variant)
         if _POLICY_WRITE_RE.search(_mask_quoted_prose(lowered)):
             return True
-        if _RUNS_STRINGS_RE.search(lowered) and _POLICY_WRITE_RE.search(lowered):
+        if _POLICY_WRITE_RE.search(lowered) and _runs_strings(lowered):
             return True
     return False
 

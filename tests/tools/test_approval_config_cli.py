@@ -14,12 +14,14 @@ from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
 from hermes_cli.approvals_test import evaluate_command
 from tools import approval
 from tools.approval import check_all_command_guards, check_dangerous_command
-from tools.approval_config_cli import command_mutates_hermes_config
 
 MUTATING = [
     "hermes config set approvals.mode off",
     "hermes -p work config unset curator.protected_skills",
     "hermes --profile=work config set a b",
+    'hermes -p "work" config set a b',
+    "hermes --profile 'my work' config set a b",
+    'hermes -p "$P" approvals suggest --apply 1',
     "hermes config edit",
     "hermes config migrate",
     "hermes approvals suggest --apply 1,3",
@@ -33,6 +35,11 @@ MUTATING = [
     'eval "hermes config set a b"',
     'printf "hermes config set a b" | sh',
     'ssh box "hermes config set a b"',
+    "env FOO=1 bash -c 'hermes config set a b'",
+    "docker exec box sh -c 'hermes config set a b'",
+    "flock lock -c 'hermes config set a b'",
+    "awk 'BEGIN { system(\"hermes config set a b\") }'",
+    'git commit -m "$(hermes config set a b)"',
     'hermes config "set" a b',
     'hermes config s"e"t a b',
     "hermes 'config' set a b",
@@ -52,6 +59,8 @@ NOT_GATED = [
     # Quoted text a command only reads or passes along is data, not a command.
     "grep -r 'hermes config set' docs/",
     'git commit -m "docs: hermes config set now asks"',
+    "git commit -m 'the script runs hermes config set'",
+    "grep -rn 'hermes config set' tools/*.py",
     'echo "hermes config set a b"',
 ]
 
@@ -88,11 +97,13 @@ def human(monkeypatch):
 
 @pytest.mark.parametrize("command", MUTATING)
 def test_config_writing_spellings_are_detected(command):
+    from tools.approval_config_cli import command_mutates_hermes_config
     assert command_mutates_hermes_config(command)
 
 
 @pytest.mark.parametrize("command", NOT_GATED)
 def test_reads_quoted_mentions_and_unrelated_commands_run_without_asking(command, break_glass_home, human):
+    from tools.approval_config_cli import command_mutates_hermes_config
     asked, _ = human
     assert not command_mutates_hermes_config(command)
     assert check_all_command_guards(command, "local")["approved"] is True
@@ -145,15 +156,26 @@ def test_secrets_are_masked_on_the_prompt_and_absent_from_the_refusal(break_glas
 
 
 def test_the_rest_of_an_approved_command_still_meets_its_own_gate(break_glass_home, human, monkeypatch):
+    """Approving the config change does not approve the delete chained after it: that meets the dangerous-command
+    prompt (recorded here at ``_human_decision``, the facade's seam for it)."""
     asked, answer = human
     answer["value"] = {"approved": True, "outcome": "approved"}
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     (break_glass_home / "config.yaml").write_text(
         "model:\n  default: test-model\napprovals:\n  mode: manual\n  timeout: 300\n  cron_mode: deny\n")
     hc._LOAD_CONFIG_CACHE.clear()
+    dangerous = []
+
+    def record(spec, *, description, **_kw):
+        dangerous.append(description)
+        return {"approved": False, "message": "denied"}
+
+    monkeypatch.setattr(approval, "_human_decision", record)
     result = check_all_command_guards("hermes config set a b && rm -rf /tmp/stuff", "local")
     assert len(asked) == 1
-    assert not result.get("user_approved")  # the config prompt did not approve the delete
+    assert len(dangerous) == 1 and "delete" in dangerous[0]
+    assert result["approved"] is False
 
 
 def test_the_pattern_layer_entry_point_asks_too(break_glass_home, human):
@@ -176,6 +198,7 @@ def test_the_dry_run_reports_the_prompt_even_under_yolo(break_glass_home):
 
 
 def test_detection_stays_linear_on_adversarial_input():
+    from tools.approval_config_cli import command_mutates_hermes_config
     command = "hermes " + "-a; hermes " * 11000
     start = time.monotonic()
     command_mutates_hermes_config(command)

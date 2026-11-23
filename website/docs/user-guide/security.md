@@ -98,19 +98,22 @@ For destructive session slash commands (`/clear`, `/new` / `/reset`, `/undo`, `/
 `~/.hermes/config.yaml` holds the approval mode, the allowlist and other security
 settings, so the agent's file tools refuse to write it. When the agent runs
 `hermes config set`, `unset`, `edit` or `migrate` (in any profile) or
-`hermes approvals suggest --apply` in its terminal, Hermes asks you each time it
-runs the command: the prompt offers only **Approve once** or **Deny**, nothing is
+`hermes approvals suggest --apply` in its terminal, Hermes asks you before it
+runs that command: the prompt offers only **Approve once** or **Deny**, nothing is
 remembered, secrets in the command are masked on the prompt, and YOLO mode,
 `approvals.mode: off` and the allowlist do not skip it. A delegated subagent is
 refused outright, and with no one there to answer (cron, an unattended platform)
 the command is refused. Reading config (`hermes config get`, `show`, `check`) is
-not gated, and neither is text that only mentions the command (a `grep` pattern,
-a commit message). `hermes approvals test "<command>"` shows the verdict.
+not gated, and neither is quoted text that only mentions the command (a `grep`
+pattern, a commit message) unless the same command line also runs a shell or an
+interpreter. `hermes approvals test "<command>"` shows the verdict.
 
 Like the other approval patterns this is a safety net, not a boundary. It does not
 see a script that writes the file itself, `execute_code`, input typed into a
-background shell, or other subcommands that change config (`hermes tools`,
-`hermes plugins`, `hermes import` and similar).
+background shell, shell tricks such as brace expansion or a verb fed in by
+`xargs`, or other subcommands that change config (`hermes tools`, `hermes plugins`,
+`hermes import` and similar). In a desktop batch that also runs a flagged command
+under YOLO, the prompt can appear twice.
 
 ### Supervised-gateway lifecycle restriction
 
