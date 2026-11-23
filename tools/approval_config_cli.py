@@ -20,10 +20,12 @@ from tools.approval_detection import (
     _lower_preserving_flags, _mask_quoted_prose, detect_dangerous_command,
 )
 
-# At most eight global flags (each with an optional value, quoted or not: `-p "work"`) before the subcommand: Hermes
-# has a handful, and a bound
+# At most eight global flags (each with an optional value, quoted or not: `-p "work"`, `--profile="my work"`) before
+# the subcommand; an unquoted value never starts on a quote, so `-p "work" chat -q "hi"` cannot be misread. Hermes
+# has a handful of flags, and a bound
 # keeps the scan linear on adversarial input, where an unbounded run from every `hermes` start point is quadratic.
-_FLAGS = r'(?:-\S++(?:\s++(?:["\'][^"\'\n]*+["\']|(?!-\S)\S++))?\s++){0,8}'
+_FLAGS = (r'(?:-[^\s=]++(?:=(?:["\'][^"\'\n]*+["\']\S*+|(?!["\'])\S*+))?'
+          r'(?:\s++(?:["\'][^"\'\n]*+["\']|(?![-"\'])\S++))?\s++){0,8}')
 _HERMES = r'\b(?:hermes(?:\.exe)?|hermes_cli(?:[./]main(?:\.py)?)?)\s+' + _FLAGS
 # A verb or subcommand word that is quoted, partly quoted (`s"e"t`) or built at run time (`$(...)`, `${...}`,
 # backticks) counts too: quote-masking blanks it, its value is unknown here, and an extra prompt is cheap.
@@ -40,7 +42,8 @@ _RUNNERS = frozenset((
     "eval", "source", ".", "bash", "sh", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd", "cmd.exe",
     "py", "perl", "ruby", "node", "deno", "bun", "php", "awk", "gawk", "mawk", "vim", "nvim", "ssh", "watch", "su",
     "runuser", "script", "parallel", "xargs", "env", "tmux", "screen", "flock", "at", "batch", "find",
-    "docker", "podman", "kubectl", "nsenter", "chroot",
+    "docker", "podman", "kubectl", "nsenter", "chroot", "doas", "busybox", "systemd-run", "pkexec", "unshare",
+    "firejail", "bwrap",
 ))
 _PYTHON_RE = re.compile(r'python[\d.]*(?:\.exe)?')
 
