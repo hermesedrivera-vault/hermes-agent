@@ -33,7 +33,7 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
     de-obfuscated forms the detectors actually evaluated).
     """
     from tools import approval
-    from tools import approval_context, approval_detection, approval_floors
+    from tools import approval_config_cli, approval_context, approval_detection, approval_floors
     # Sync config-persisted "always" patterns so the allowlist check below sees what the runtime
     # would see (load is read-only).
     try:
@@ -87,6 +87,14 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
             "user-deny", rule=deny_pattern,
             detail="matches a user-defined approvals.deny rule in "
                    "config.yaml (blocked even under --yolo / mode=off)",
+        )
+
+    # 4b. A Hermes config change asks every time: not bypassed by yolo, mode=off or the allowlist.
+    if approval_config_cli.command_mutates_hermes_config(command):
+        return result(
+            "ask-approval", rule="Hermes config change",
+            detail="writes Hermes config; the runtime asks every time (approve once or deny, even under "
+                   "--yolo / mode=off / the allowlist) and refuses it in a subagent or with no one to answer",
         )
 
     # 5. Yolo / approvals.mode=off bypass.

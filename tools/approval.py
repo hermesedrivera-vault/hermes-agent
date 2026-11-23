@@ -1125,9 +1125,9 @@ def check_dangerous_command(command: str, env_type: str,
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
-    blocked = config_cli_gate(command)  # before yolo and the allowlist: asks every time
-    if blocked is not None:
-        return blocked
+    decision = config_cli_gate(command)  # before yolo and the allowlist: asks every time
+    if decision is not None:
+        return decision
     if _yolo_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
@@ -1185,15 +1185,16 @@ def check_all_command_guards(command: str, env_type: str,
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
-    # Before the prepared batch, yolo, mode=off, the allowlist and the unattended fall-through: asks every time.
-    blocked = config_cli_gate(command)
-    if blocked is not None:
-        return blocked
 
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
     if prepared is not None:
         return prepared
+    # Before yolo, mode=off, the allowlist and the unattended fall-through: asks every time. After the prepared batch,
+    # whose prepare pass already asked here and stored the human's answer for this exact command.
+    decision = config_cli_gate(command)
+    if decision is not None:
+        return decision
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":

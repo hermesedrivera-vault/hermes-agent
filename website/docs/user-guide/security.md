@@ -96,14 +96,21 @@ For destructive session slash commands (`/clear`, `/new` / `/reset`, `/undo`, `/
 ### Hermes config changes from the terminal
 
 `~/.hermes/config.yaml` holds the approval mode, the allowlist and other security
-settings, so the agent's file tools refuse to write it. When the agent runs a
-config-changing CLI command in its terminal (`hermes config set`, `unset`, `edit`
-or `migrate`, in any profile), Hermes asks you every time: the prompt offers only
-**Approve once** or **Deny**, nothing is remembered, and YOLO mode,
-`approvals.mode: off` and the allowlist do not skip it. With no one there to
-answer (cron, an unattended platform), the command is refused. Reading config
-(`hermes config get`, `show`, `check`) is not gated. Like the other approval
-patterns, this catches the CLI, not a script that writes the file itself.
+settings, so the agent's file tools refuse to write it. When the agent runs
+`hermes config set`, `unset`, `edit` or `migrate` (in any profile) or
+`hermes approvals suggest --apply` in its terminal, Hermes asks you each time it
+runs the command: the prompt offers only **Approve once** or **Deny**, nothing is
+remembered, secrets in the command are masked on the prompt, and YOLO mode,
+`approvals.mode: off` and the allowlist do not skip it. A delegated subagent is
+refused outright, and with no one there to answer (cron, an unattended platform)
+the command is refused. Reading config (`hermes config get`, `show`, `check`) is
+not gated, and neither is text that only mentions the command (a `grep` pattern,
+a commit message). `hermes approvals test "<command>"` shows the verdict.
+
+Like the other approval patterns this is a safety net, not a boundary. It does not
+see a script that writes the file itself, `execute_code`, input typed into a
+background shell, or other subcommands that change config (`hermes tools`,
+`hermes plugins`, `hermes import` and similar).
 
 ### Supervised-gateway lifecycle restriction
 
